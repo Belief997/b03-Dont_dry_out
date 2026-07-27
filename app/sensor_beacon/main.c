@@ -449,7 +449,10 @@ static void handle_event_active(void)
 int main(void)
 {
     log_init();
-    NRF_LOG_INFO("sensor_beacon boot.");
+    while(1)
+    {
+        NRF_LOG_INFO("sensor_beacon boot.");
+    }
 
     /* 读复位状态与计数器(SoftDevice 尚未使能 → 直接寄存器访问) */
     uint32_t resetreas = 0;
