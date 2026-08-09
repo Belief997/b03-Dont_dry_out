@@ -53,6 +53,7 @@
 #include "nrf_log.h"
 #include "nrf_log_ctrl.h"
 #include "nrf_log_default_backends.h"
+#include "nrf_delay.h"
 
 /* ==================================================================
  *  可配置参数(TODO: 按实际硬件/需求修改)
@@ -62,9 +63,8 @@
  * TODO: 改为实际布线的引脚号。当前 13 = pca10040 DK 的 Button1,便于台架测试。 */
 #define WAKE_PIN                    13
 
-/* 唤醒引脚上拉/下拉: 比较器为推挽输出 → NOPULL。若为开漏需改为对应上/下拉。
- * TODO: 确认比较器输出类型。 */
-#define WAKE_PIN_PULL               NRF_GPIO_PIN_NOPULL
+/* 唤醒引脚上拉/下拉: 使能内部上拉 */
+#define WAKE_PIN_PULL               NRF_GPIO_PIN_PULLUP
 
 /* 传感器 ADC 输入通道。TODO: 改为实际模拟输入引脚对应的 AINx。
  * AIN0=P0.02, AIN1=P0.03, AIN2=P0.04, AIN3=P0.05 ... */
@@ -98,6 +98,29 @@
 
 /* 计数器存放的 GPREGRET 编号(0 = GPREGRET,1 = GPREGRET2) */
 #define GPREGRET_ID_COUNTER         0
+
+/* ==================================================================
+ *  HX711 引脚 & 参数(TODO: 按实际布线修改)
+ * ================================================================== */
+/* DT(DOUT): 数据输出, HX711 转换完成时拉低, 空闲为高 */
+#define HX711_DT_PIN                16
+/* SCK(PD_SCK): 时钟输出, 25/26/27 个脉冲分别选通道 A@128 / B@32 / A@64 */
+#define HX711_SCK_PIN               15
+
+/* 不同增益对应的 SCK 脉冲总数(含 24bit 数据 + N 个增益选择脉冲) */
+#define HX711_PULSES_CHA_128        25
+#define HX711_PULSES_CHB_32         26
+#define HX711_PULSES_CHA_64         27
+
+/* DOUT 等待超时(循环迭代次数)。
+ * 64MHz Cortex-M4: 每轮 ~6 cycles ≈ 94ns → 5M 轮 ≈ 470ms,
+ * 足以覆盖 HX711 10Hz 模式 100ms 转换 + 首次上电稳定 400ms。 */
+#define HX711_TIMEOUT_LOOPS         5000000
+
+/* 当前 HX711 增益设定(脉冲数), 上电默认 = CHA_128 */
+static uint8_t m_hx711_pulses = HX711_PULSES_CHA_128;
+
+APP_TIMER_DEF(m_hx711_timer);               /* HX711 周期采样定时器 */
 
 /* ==================================================================
  *  广播负载布局(厂商自定义数据段内的字节偏移)
@@ -134,6 +157,7 @@ static ble_gap_adv_data_t       m_adv_data =
 static ble_gap_adv_params_t     m_adv_params;
 
 APP_TIMER_DEF(m_settling_timer);            /* 传感器稳定等待定时器(单次) */
+APP_TIMER_DEF(m_test_timer);                /* 测试: 500ms 周期采样定时器 */
 
 static volatile bool            m_settled  = false;   /* 稳定等待结束 */
 static volatile bool            m_adv_done = false;    /* 广播时长到,已终止 */
@@ -443,16 +467,237 @@ static void handle_event_active(void)
 }
 
 /* ==================================================================
+ *  测试: 500ms 周期 ADC 采样回调
+ * ================================================================== */
+static void test_timer_handler(void * p_context)
+{
+    (void)p_context;
+
+    uint16_t sensor_raw = saadc_sample_channel(SAADC_CH_SENSOR);
+    uint16_t batt_raw   = saadc_sample_channel(SAADC_CH_BATTERY);
+
+    NRF_LOG_INFO("ADC: sensor=%u raw (%u mV), batt=%u raw (%u mV)",
+                 sensor_raw, saadc_raw_to_mv(sensor_raw),
+                 batt_raw, saadc_raw_to_mv(batt_raw));
+}
+
+/* ==================================================================
+ *  HX711 驱动 —— 双通道桥式传感器 ADC
+ * ==================================================================
+ *
+ * HX711 接口:
+ *   DT  (DOUT)   — 数据输出,空闲高,转换完成自动拉低,读完 24+ 脉冲后恢复高
+ *   SCK (PD_SCK) — 时钟输入,由 MCU 输出 25/26/27 个正脉冲
+ *   每帧 = 24bit 数据(MSB first, 二进制补码) + 1~3 个增益选择脉冲
+ *
+ * 通道切换:
+ *   上电默认 = Channel A @ 增益 128, 后续通道由每帧最后的多余脉冲数决定:
+ *     25 脉冲 → 下一次转换 = Channel A, 增益 128
+ *     26 脉冲 → 下一次转换 = Channel B, 增益 32
+ *     27 脉冲 → 下一次转换 = Channel A, 增益 64
+ *   本驱动只使用 25(A) 与 26(B), 如需 A@64 可自行扩展。
+ *
+ * 关键时序(VDDA=5V, 典型值):
+ *   SCK 高/低电平最小 0.2µs, 最大 50µs → 本驱动用 1µs 延时
+ *   数据在 SCK 上升沿后 ≤0.1µs 稳定, 在 SCK 下降沿(即低电平期间)采样
+ *   转换时间: 10Hz 模式 ~100ms, 80Hz 模式 ~12.5ms(RATE 引脚控制)
+ */
+
+static void hx711_init(void)
+{
+    nrf_gpio_cfg_output(HX711_SCK_PIN);
+    nrf_gpio_pin_clear(HX711_SCK_PIN);
+    nrf_gpio_cfg_input(HX711_DT_PIN, NRF_GPIO_PIN_PULLUP);
+    m_hx711_pulses = HX711_PULSES_CHA_128;  /* 上电默认 */
+}
+
+/* 检查 HX711 是否数据就绪(DT == 低) */
+static inline bool hx711_is_ready(void)
+{
+    return (nrf_gpio_pin_read(HX711_DT_PIN) == 0);
+}
+
+/* 读一帧原始值(阻塞)。
+ *   pulses : 总脉冲数 = 24(数据) + N(增益选择), N ∈ {1,2,3}
+ *   返回   : 24bit 有符号值(符号扩展到 int32_t)
+ *   超时   : 返回 INT32_MIN, 调用方自行容错
+ *
+ * ⚠ 本函数内 SCK 脉冲用 nrf_delay_us(1) 忙等,总耗时 <60µs,可接受;
+ *   但等待 DOUT 就绪时若 HX711 正在转换,将忙等 ~100ms,仅适合测试阶段。 */
+static int32_t hx711_read_raw(uint8_t pulses)
+{
+    int32_t val = 0;
+
+    /* 等待 DOUT 拉低(转换完成), 含超时保护 */
+    {
+        uint32_t timeout = HX711_TIMEOUT_LOOPS;
+        while (!hx711_is_ready() && (--timeout != 0))
+        {
+            /* 空转轮询, ~3 cycles/loop @64MHz ≈ 50ns → 200k ≈ 10ms */;
+        }
+        if (timeout == 0)
+        {
+            return INT32_MIN;   /* 超时: HX711 未响应 */
+        }
+    }
+
+    /* 读 24bit, MSB first; 在 SCK 低电平期间采样 DT */
+    for (uint8_t i = 0; i < 24; i++)
+    {
+        nrf_gpio_pin_set(HX711_SCK_PIN);
+        nrf_delay_us(1);
+        val = (val << 1) | (nrf_gpio_pin_read(HX711_DT_PIN) ? 1 : 0);
+        nrf_gpio_pin_clear(HX711_SCK_PIN);
+        nrf_delay_us(1);
+    }
+
+    /* 第 25~pulses 个脉冲: 不读数据,仅用于设置下次转换的通道/增益 */
+    for (uint8_t i = 24; i < pulses; i++)
+    {
+        nrf_gpio_pin_set(HX711_SCK_PIN);
+        nrf_delay_us(1);
+        nrf_gpio_pin_clear(HX711_SCK_PIN);
+        nrf_delay_us(1);
+    }
+
+    m_hx711_pulses = pulses;    /* 记录当前增益设定 */
+
+    /* 符号扩展: 24bit 二进制补码 → 32bit */
+    if (val & 0x800000)
+    {
+        val |= 0xFF000000;
+    }
+
+    return val;
+}
+
+/* 读取指定通道的 ADC 值(自动处理通道切换)。
+ *   target_pulses : HX711_PULSES_CHA_128 或 HX711_PULSES_CHB_32
+ *   返回          : 24bit 有符号原始值, 超时返回 INT32_MIN
+ *
+ * 说明:
+ *   HX711 读到的数据来自"上一次"脉冲序列选择的通道。因此切换通道需要:
+ *     1) 用目标脉冲数读一帧(得到旧通道数据,丢弃) → HX711 开始在新通道转换
+ *     2) 等待下次转换完成
+ *     3) 再用目标脉冲数读一帧 → 得到新通道数据
+ *   若当前已在目标通道则直接读取。 */
+static int32_t hx711_read_channel(uint8_t target_pulses)
+{
+    if (m_hx711_pulses != target_pulses)
+    {
+        /* 切换通道: 读一次旧数据(丢弃),内部等待转换完成后设置新通道 */
+        int32_t dummy = hx711_read_raw(target_pulses);
+        if (dummy == INT32_MIN) { return INT32_MIN; }
+        /* 此时 HX711 正以新通道/增益进行转换,需等完成后再读 */
+    }
+    return hx711_read_raw(target_pulses);
+}
+
+/* HX711 定时采样回调: 依次读 Channel A 和 Channel B 并通过日志输出 */
+static void hx711_timer_handler(void * p_context)
+{
+    (void)p_context;
+
+    /* 注意: 切换通道时每次读取都可能等待 ~100ms(HX711 转换时间),
+     * 因此 A+B 两通道完成一次至少需 ~200ms; 定时器周期需大于此值。
+     * 若 HX711 配置为 80Hz(RATE=高),则转换仅需 ~12.5ms, 可缩短周期。 */
+
+    int32_t raw_a = hx711_read_channel(HX711_PULSES_CHA_128);
+    int32_t raw_b = hx711_read_channel(HX711_PULSES_CHB_32);
+
+    if (raw_a == INT32_MIN || raw_b == INT32_MIN)
+    {
+        NRF_LOG_WARNING("HX711: timeout! chA=%ld chB=%ld", raw_a, raw_b);
+    }
+    else
+    {
+        NRF_LOG_INFO("HX711: chA=%ld chB=%ld", raw_a, raw_b);
+    }
+}
+
+/* ==================================================================
  *  main
  * ================================================================== */
 
 int main(void)
 {
     log_init();
-    while(1)
     {
         NRF_LOG_INFO("sensor_beacon boot.");
+        // NRF_LOG_FLUSH();
     }
+
+#if 1
+    /* ===== HX711 测试: 定时读取两通道 ADC 数值并通过日志/串口打印 ===== */
+
+    /* 1) 使能 BLE 协议栈 (提供 LFCLK 给 app_timer) */
+    ble_stack_init();
+
+    /* 2) 初始化定时器 & 电源管理 */
+    timers_init();
+    power_management_init();
+
+    /* 3) 初始化 HX711(配置 DT/SCK GPIO) */
+    hx711_init();
+
+    /* 4) 创建周期定时器: 按 HX711 转换速率选择周期。
+     *    10Hz 模式(默认,RATE=低): 转换 ~100ms, A+B ~200ms, 定时 ≥500ms
+     *    80Hz 模式(RATE=高)    : 转换 ~12.5ms, A+B ~25ms, 定时 ≥100ms
+     *    TODO: 调为实际值 */
+    {
+        ret_code_t err = app_timer_create(&m_hx711_timer, APP_TIMER_MODE_REPEATED,
+                                          hx711_timer_handler);
+        APP_ERROR_CHECK(err);
+        err = app_timer_start(m_hx711_timer, APP_TIMER_TICKS(500), NULL);
+        APP_ERROR_CHECK(err);
+    }
+
+    NRF_LOG_INFO("HX711 test running: read chA/chB every 500ms...");
+    NRF_LOG_FLUSH();
+
+    /* 5) 主循环: 空闲 + 刷新日志（日志后端若配置为 UART 则从串口输出） */
+    for (;;)
+    {
+        nrf_pwr_mgmt_run();
+    }
+#endif
+
+
+#if 0
+    /* ===== ADC 测试: 每 500ms 采样并通过日志/串口打印 ===== */
+
+    /* 1) 使能 BLE 协议栈 (提供 LFCLK 给 app_timer) */
+    ble_stack_init();
+
+    /* 2) 初始化定时器 & 电源管理 */
+    timers_init();
+    power_management_init();
+
+    /* 3) 初始化 SAADC */
+    saadc_init();
+
+    /* 4) 创建 500ms 周期定时器并启动 */
+    {
+        ret_code_t err = app_timer_create(&m_test_timer, APP_TIMER_MODE_REPEATED,
+                                          test_timer_handler);
+        APP_ERROR_CHECK(err);
+        err = app_timer_start(m_test_timer, APP_TIMER_TICKS(500), NULL);
+        APP_ERROR_CHECK(err);
+    }
+
+    NRF_LOG_INFO("ADC test running: sample every 500ms...");
+    NRF_LOG_FLUSH();
+
+    /* 5) 主循环: 空闲 + 刷新日志（日志后端若配置为 UART 则从串口输出） */
+    for (;;)
+    {
+        nrf_pwr_mgmt_run();
+    }
+#endif
+
+
+#if 0
+
 
     /* 读复位状态与计数器(SoftDevice 尚未使能 → 直接寄存器访问) */
     uint32_t resetreas = 0;
@@ -483,4 +728,6 @@ int main(void)
         NRF_LOG_FLUSH();
         nrf_pwr_mgmt_run();
     }
+
+#endif
 }

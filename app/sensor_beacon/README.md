@@ -35,14 +35,33 @@ make flash               # 烧应用并复位
 日志:用 JLink RTT Viewer 或 nRF Connect 的 RTT 终端查看(芯片选 `NRF52810_XXAA`)。
 > 调试器连接时 System OFF 被仿真、不会真掉电;测真实功耗请拔调试器。
 
-## 上板前必改(TODO,集中在 main.c 顶部)
+## 当前配置(集中在 main.c 顶部)
 
-- `WAKE_PIN` —— 比较器输出接的 GPIO(当前 `13` = DK Button1,仅便于台架测试)
-- `WAKE_PIN_PULL` —— 比较器推挽→NOPULL;开漏→上/下拉
-- `SENSOR_AIN` —— 传感器模拟输入 AINx
-- `SETTLING_TIME_MS` —— 传感器稳定等待(1000~2000)
-- `ADV_INTERVAL_MS` / `ADV_DURATION_MS` / `ADV_TX_POWER_DBM` —— 广播参数
-- `APP_COMPANY_IDENTIFIER` / `DEVICE_ID_LEN` —— 负载字段
+| 宏 | 当前值 | 说明 |
+|----|--------|------|
+| `WAKE_PIN` | **13** (P0.13) | 比较器输出 GPIO;当前为 DK Button1 便于台架测试,上真机时需改 |
+| `WAKE_PIN_PULL` | **`NRF_GPIO_PIN_PULLUP`** | 使能内部上拉 |
+| `SENSOR_AIN` | **`NRF_SAADC_INPUT_AIN0`** (P0.02) | 传感器模拟输入 |
+| `SAADC_CH_SENSOR` / `SAADC_CH_BATTERY` | 0 / 1 | 传感器通道 / 电池通道(内部 VDD) |
+| `SETTLING_TIME_MS` | **1500** | 传感器上电稳定等待时间(ms) |
+| `ADV_INTERVAL_MS` / `ADV_DURATION_MS` | **100 ms** / **2000 ms** | 广播间隔与总时长 |
+| `ADV_TX_POWER_DBM` | **0 dBm** | 广播发射功率 |
+| `APP_COMPANY_IDENTIFIER` | **0xFFFF** | SIG 保留 ID(测试用) |
+| `DEVICE_ID_LEN` | **2** | 广播中设备 ID 字节数 |
+
+### ADC 参考配置
+
+- 参考源: **内部 0.6V** (`NRF_SAADC_REFERENCE_INTERNAL`)
+- 增益: **1/6** (`NRF_SAADC_GAIN1_6`),满量程 = 0.6V × 6 = **3.6V**
+- 分辨率: **12 位**(`sdk_config.h` 中配置)
+
+### 上真机前仍需确认
+
+- `WAKE_PIN` —— 改为实际布线的 GPIO 引脚号
+- `SETTLING_TIME_MS` —— 按传感器手册调整
+- `ADV_INTERVAL_MS` / `ADV_DURATION_MS` / `ADV_TX_POWER_DBM` —— 按功耗/可靠性折中调整
+- `APP_COMPANY_IDENTIFIER` —— 若有 SIG 分配的 Company ID 请替换
+- `DEVICE_ID_LEN` —— 按需 2 或 4 字节
 
 迁真机(真实 52810 硅片)时,记得从 `armgcc/Makefile` 删除 `DEVELOP_IN_NRF52832`(见 [`dev/note/03`](../../note/03-nrf52810-project-config.md))。
 
