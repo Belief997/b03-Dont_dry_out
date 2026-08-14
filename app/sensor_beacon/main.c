@@ -83,9 +83,12 @@
 
 /* 负载协议魔数 + 版本(置于负载最前):
  *   - 魔数供网关在 0xFFFF 通用 Company ID 下过滤掉他人广播;
- *   - 版本供日后平滑演进负载格式。改布局时请递增版本并同步对接文档。 */
+ *   - 版本供日后平滑演进负载格式。改布局时请递增版本并同步对接文档。
+ *
+ * v0x02: 移除外部传感器电压字段, 新增 3 路 24bit 传感器通道(见负载布局)。
+ *        与 v0x01 不兼容, 网关须按版本分支解析。 */
 #define APP_PROTO_MAGIC             0xAB
-#define APP_PROTO_VERSION           0x01
+#define APP_PROTO_VERSION           0x02
 
 /* 广播里放几字节设备 ID(取自 FICR->DEVICEID)。TODO: 2 或 4。 */
 #define DEVICE_ID_LEN               2
@@ -219,14 +222,39 @@ static bool ma_ready(const ma_filter_t * f)
  *   [2 .. 1+DEVICE_ID_LEN]     设备 ID (小端)
  *   [..]                       计数器   (1 字节)
  *   [.. +1]                    电池电压 (2 字节, 小端, 单位 mV)
+ *   [.. +2]                    传感器通道 0 (3 字节, 小端, 有符号 24bit)
+ *   [.. +3]                    传感器通道 1 (3 字节, 小端, 有符号 24bit)
+ *   [.. +3]                    传感器通道 2 (3 字节, 小端, 有符号 24bit)
  * 网关先校验 [0]=魔数、[1]=版本,再按版本解析后续字段。
+ *
+ * 传感器通道语义(与 HX711 实例对应):
+ *   ch0 = HX711 #1 Channel A   ch1 = HX711 #1 Channel B   ch2 = HX711 #2 Channel A
+ *
+ * ⚠ 每通道 3 字节而非 2 字节: HX711 原生输出有符号 24bit,实测读数
+ *   (见 _solve.py 标定数据)达 ±8 万量级,远超 int16 的 ±32767,压成
+ *   2 字节会溢出失真。故保留 24bit 原样传输,由网关做符号扩展。
  */
+#define SENSOR_CH_COUNT             3
+#define SENSOR_VAL_BYTES            3       /* 有符号 24bit */
+
 #define OFF_MAGIC                   0
 #define OFF_VERSION                 1
 #define OFF_DEVICE_ID               2
 #define OFF_COUNTER                 (OFF_DEVICE_ID + DEVICE_ID_LEN)
 #define OFF_BATTERY                 (OFF_COUNTER + 1)
-#define MANUF_DATA_LEN              (OFF_BATTERY + 2)
+#define OFF_SENSORS                 (OFF_BATTERY + 2)
+#define MANUF_DATA_LEN              (OFF_SENSORS + SENSOR_CH_COUNT * SENSOR_VAL_BYTES)
+
+/* 广播包字节预算(BLE 4.x 传统广播, 上限 31 字节):
+ *     Flags 段            = 长度1 + 类型1 + 数据1            =  3
+ *     厂商自定义段头      = 长度1 + 类型1 + Company ID 2     =  4
+ *     → 负载可用          = 31 - 3 - 4                       = 24
+ * 当前 MANUF_DATA_LEN = 16, 余量 8 字节。加字段时此断言会兜住超长。 */
+#define MANUF_DATA_LEN_MAX          (BLE_GAP_ADV_SET_DATA_SIZE_MAX \
+                                     - AD_TYPE_FLAGS_SIZE          \
+                                     - AD_DATA_OFFSET              \
+                                     - AD_TYPE_MANUF_SPEC_DATA_ID_SIZE)
+STATIC_ASSERT(MANUF_DATA_LEN <= MANUF_DATA_LEN_MAX);
 
 /* ==================================================================
  *  全局状态
@@ -349,7 +377,22 @@ static void saadc_uninit(void)
  *  广播负载组装
  * ================================================================== */
 
-static void payload_build(uint16_t batt_raw)
+/* 写入一个有符号 24bit 值(小端)。超出 24bit 量程时钳位,避免高位被截断
+ * 后符号翻转(例如 0x00800000 被截成负数)。 */
+static void payload_put_s24(uint8_t * p_dst, int32_t val)
+{
+    if (val > 0x7FFFFF)        { val = 0x7FFFFF; }
+    else if (val < -0x800000)  { val = -0x800000; }
+
+    uint32_t u = (uint32_t)val;      /* 负数按二进制补码取低 24bit */
+    p_dst[0] = (uint8_t)(u & 0xFF);
+    p_dst[1] = (uint8_t)((u >> 8) & 0xFF);
+    p_dst[2] = (uint8_t)((u >> 16) & 0xFF);
+}
+
+/* p_sensors: SENSOR_CH_COUNT 个通道值(ch0=#1chA, ch1=#1chB, ch2=#2chA)。
+ *            传 NULL 表示本次无传感器数据,对应字段填 0。 */
+static void payload_build(uint16_t batt_raw, const int32_t * p_sensors)
 {
     uint32_t dev_id = NRF_FICR->DEVICEID[0];    /* 64bit 唯一 ID 的低 32bit */
 
@@ -368,6 +411,13 @@ static void payload_build(uint16_t batt_raw)
     uint16_t batt_mv = saadc_raw_to_mv(batt_raw);
     m_manuf_data[OFF_BATTERY]      = (uint8_t)(batt_mv & 0xFF);
     m_manuf_data[OFF_BATTERY + 1]  = (uint8_t)(batt_mv >> 8);
+
+    /* 3 路传感器通道, 各 3 字节小端有符号 24bit */
+    for (uint8_t ch = 0; ch < SENSOR_CH_COUNT; ch++)
+    {
+        payload_put_s24(&m_manuf_data[OFF_SENSORS + ch * SENSOR_VAL_BYTES],
+                        (p_sensors != NULL) ? p_sensors[ch] : 0);
+    }
 }
 
 /* ==================================================================
@@ -406,11 +456,11 @@ static void ble_stack_init(void)
     APP_ERROR_CHECK(err);   /* 若报 NRF_ERROR_NO_MEM,按提示调整 .ld 中 RAM ORIGIN */
 }
 
-static void advertising_init(uint16_t batt_raw)
+static void advertising_init(uint16_t batt_raw, const int32_t * p_sensors)
 {
     ret_code_t err;
 
-    payload_build(batt_raw);
+    payload_build(batt_raw, p_sensors);
 
     ble_advdata_manuf_data_t manuf =
     {
@@ -522,9 +572,19 @@ static void handle_event_active(void)
     saadc_uninit();
     NRF_LOG_INFO("batt_mv=%u", saadc_raw_to_mv(batt_raw));
 
-    /* 5) 组装并发送非连接广播,等待时长到(SD 产生 ADV_SET_TERMINATED) */
+    /* 5) 组装并发送非连接广播,等待时长到(SD 产生 ADV_SET_TERMINATED)
+     *    传感器值取滑动平均(比单帧原始值更稳);当前唤醒路径尚未接入 HX711
+     *    采集,窗口为空时 ma_avg() 返回 0,即三通道字段为占位 0。
+     *    TODO: 接入 HX711 采集后,此处应在稳定等待期内完成取样再广播。 */
+    int32_t sensors[SENSOR_CH_COUNT] =
+    {
+        ma_avg(&m_ma_1a),   /* ch0: HX711 #1 Channel A */
+        ma_avg(&m_ma_1b),   /* ch1: HX711 #1 Channel B */
+        ma_avg(&m_ma_2a)    /* ch2: HX711 #2 Channel A */
+    };
+
     m_adv_done = false;
-    advertising_init(batt_raw);
+    advertising_init(batt_raw, sensors);
     advertising_start();
     idle_until(&m_adv_done);
 
