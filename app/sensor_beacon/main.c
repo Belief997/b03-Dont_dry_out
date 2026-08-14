@@ -12,8 +12,8 @@
  *   将 MCU 从 System OFF 唤醒(唤醒 = 复位)。唤醒后:
  *     1) 读复位原因 + GPREGRET 中保存的 8bit 计数器;
  *     2) 读唤醒引脚电平判定当前处于事件段(高)还是清除段(低);
- *     3) 事件段: 计数器 +1 → 等待 1~2s 传感器稳定 → SAADC 采集(传感器 +
- *        电池电压) → 使能 S112 → 发送非连接广播(含设备 ID/计数器/采样值)
+ *     3) 事件段: 计数器 +1 → 等待 1~2s 传感器稳定 → SAADC 采集(电池电压)
+ *        → 使能 S112 → 发送非连接广播(含设备 ID/计数器/电池电压)
  *        → 广播结束后重新武装 SENSE → 回到 System OFF;
  *     4) 清除段/冷启动: 不广播,重新武装 SENSE → 回到 System OFF。
  *
@@ -66,11 +66,8 @@
 /* 唤醒引脚上拉/下拉: 使能内部上拉 */
 #define WAKE_PIN_PULL               NRF_GPIO_PIN_PULLUP
 
-/* 传感器 ADC 输入通道。TODO: 改为实际模拟输入引脚对应的 AINx。
- * AIN0=P0.02, AIN1=P0.03, AIN2=P0.04, AIN3=P0.05 ... */
-#define SENSOR_AIN                  NRF_SAADC_INPUT_AIN0
-#define SAADC_CH_SENSOR             0
-#define SAADC_CH_BATTERY            1   /* 电池: 内部 VDD 输入,无需外部引脚 */
+/* 电池电压 ADC 通道: 内部 VDD 输入,无需外部引脚 */
+#define SAADC_CH_BATTERY            1
 
 /* 传感器上电到数据稳定的等待时间(ms)。TODO: 按传感器手册确定 (1000~2000)。 */
 #define SETTLING_TIME_MS            1500
@@ -100,16 +97,28 @@
 #define GPREGRET_ID_COUNTER         0
 
 /* ==================================================================
- *  HX711 引脚 & 参数(TODO: 按实际布线修改)
- * ================================================================== */
+ *  HX711 引脚 & 参数
+ * ==================================================================
+ *
+ * 引脚选取约束(同时满足 PCA10040 DK 台架调试与 E73-TBM 真机):
+ *   - DK 占用    : P0.13~16 = Button1~4, P0.17~20 = LED1~4, P0.06/08 = UART
+ *   - E73-TBM 占用: P0.13/14 = 按键, P0.17/18 = LED, P0.05~08 = CH340 UART,
+ *                   P0.09/10 = NFC 焊盘, P0.21 = 复位
+ *   - P0.25~29 紧邻射频,数据手册 Table 100 限定"低驱动、低频 I/O only",
+ *     SCK 为数百 kHz 时钟脉冲,不可用
+ *   - P0.02~05 = AIN0~3,留给模拟输入
+ *   → 两板交集中安全可用: P0.11, P0.12, P0.22, P0.23, P0.24
+ *
+ * ⚠ P0.22/23/24 在 QFN48 上与 SWDIO/SWDCLK 相邻但功能独立,不影响调试。
+ */
 
 /* --- HX711 #1 --- */
-#define HX711_1_DT_PIN              16
-#define HX711_1_SCK_PIN             15
+#define HX711_1_DT_PIN              11
+#define HX711_1_SCK_PIN             12
 
 /* --- HX711 #2 --- */
-#define HX711_2_DT_PIN              20
-#define HX711_2_SCK_PIN             19
+#define HX711_2_DT_PIN              23
+#define HX711_2_SCK_PIN             24
 
 /* 不同增益对应的 SCK 脉冲总数(含 24bit 数据 + N 个增益选择脉冲) */
 #define HX711_PULSES_CHA_128        25
@@ -209,16 +218,14 @@ static bool ma_ready(const ma_filter_t * f)
  *   [1]                        版本   APP_PROTO_VERSION
  *   [2 .. 1+DEVICE_ID_LEN]     设备 ID (小端)
  *   [..]                       计数器   (1 字节)
- *   [.. +1]                    传感器采样 (2 字节, 小端)
- *   [.. +1]                    电池采样   (2 字节, 小端)
+ *   [.. +1]                    电池电压 (2 字节, 小端, 单位 mV)
  * 网关先校验 [0]=魔数、[1]=版本,再按版本解析后续字段。
  */
 #define OFF_MAGIC                   0
 #define OFF_VERSION                 1
 #define OFF_DEVICE_ID               2
 #define OFF_COUNTER                 (OFF_DEVICE_ID + DEVICE_ID_LEN)
-#define OFF_SENSOR                  (OFF_COUNTER + 1)
-#define OFF_BATTERY                 (OFF_SENSOR + 2)
+#define OFF_BATTERY                 (OFF_COUNTER + 1)
 #define MANUF_DATA_LEN              (OFF_BATTERY + 2)
 
 /* ==================================================================
@@ -311,13 +318,7 @@ static void saadc_init(void)
     err = nrf_drv_saadc_init(NULL, saadc_callback);
     APP_ERROR_CHECK(err);
 
-    /* 传感器通道: 单端,增益 1/6,内部 0.6V 参考 → 满量程 3.6V */
-    nrf_saadc_channel_config_t ch_sensor =
-        NRF_DRV_SAADC_DEFAULT_CHANNEL_CONFIG_SE(SENSOR_AIN);
-    err = nrf_drv_saadc_channel_init(SAADC_CH_SENSOR, &ch_sensor);
-    APP_ERROR_CHECK(err);
-
-    /* 电池通道: 内部 VDD 输入,同样 1/6 增益 / 0.6V 参考 → 满量程 3.6V */
+    /* 电池通道: 内部 VDD 输入,单端,增益 1/6,内部 0.6V 参考 → 满量程 3.6V */
     nrf_saadc_channel_config_t ch_batt =
         NRF_DRV_SAADC_DEFAULT_CHANNEL_CONFIG_SE(NRF_SAADC_INPUT_VDD);
     err = nrf_drv_saadc_channel_init(SAADC_CH_BATTERY, &ch_batt);
@@ -348,7 +349,7 @@ static void saadc_uninit(void)
  *  广播负载组装
  * ================================================================== */
 
-static void payload_build(uint16_t sensor_raw, uint16_t batt_raw)
+static void payload_build(uint16_t batt_raw)
 {
     uint32_t dev_id = NRF_FICR->DEVICEID[0];    /* 64bit 唯一 ID 的低 32bit */
 
@@ -362,9 +363,6 @@ static void payload_build(uint16_t sensor_raw, uint16_t batt_raw)
     }
 
     m_manuf_data[OFF_COUNTER]      = m_counter;
-
-    m_manuf_data[OFF_SENSOR]       = (uint8_t)(sensor_raw & 0xFF);
-    m_manuf_data[OFF_SENSOR + 1]   = (uint8_t)(sensor_raw >> 8);
 
     /* 电池: 这里放毫伏值(也可直接放 raw,与网关约定即可) */
     uint16_t batt_mv = saadc_raw_to_mv(batt_raw);
@@ -408,11 +406,11 @@ static void ble_stack_init(void)
     APP_ERROR_CHECK(err);   /* 若报 NRF_ERROR_NO_MEM,按提示调整 .ld 中 RAM ORIGIN */
 }
 
-static void advertising_init(uint16_t sensor_raw, uint16_t batt_raw)
+static void advertising_init(uint16_t batt_raw)
 {
     ret_code_t err;
 
-    payload_build(sensor_raw, batt_raw);
+    payload_build(batt_raw);
 
     ble_advdata_manuf_data_t manuf =
     {
@@ -519,15 +517,14 @@ static void handle_event_active(void)
     APP_ERROR_CHECK(err);
     idle_until(&m_settled);
 
-    /* 4) 采集传感器与电池 */
-    uint16_t sensor_raw = saadc_sample_channel(SAADC_CH_SENSOR);
-    uint16_t batt_raw   = saadc_sample_channel(SAADC_CH_BATTERY);
+    /* 4) 采集电池电压 */
+    uint16_t batt_raw = saadc_sample_channel(SAADC_CH_BATTERY);
     saadc_uninit();
-    NRF_LOG_INFO("sensor_raw=%u  batt_mv=%u", sensor_raw, saadc_raw_to_mv(batt_raw));
+    NRF_LOG_INFO("batt_mv=%u", saadc_raw_to_mv(batt_raw));
 
     /* 5) 组装并发送非连接广播,等待时长到(SD 产生 ADV_SET_TERMINATED) */
     m_adv_done = false;
-    advertising_init(sensor_raw, batt_raw);
+    advertising_init(batt_raw);
     advertising_start();
     idle_until(&m_adv_done);
 
@@ -547,18 +544,15 @@ static void handle_event_active(void)
 }
 
 /* ==================================================================
- *  测试: 500ms 周期 ADC 采样回调
+ *  测试: 500ms 周期电池电压采样回调
  * ================================================================== */
 static void test_timer_handler(void * p_context)
 {
     (void)p_context;
 
-    uint16_t sensor_raw = saadc_sample_channel(SAADC_CH_SENSOR);
-    uint16_t batt_raw   = saadc_sample_channel(SAADC_CH_BATTERY);
+    uint16_t batt_raw = saadc_sample_channel(SAADC_CH_BATTERY);
 
-    NRF_LOG_INFO("ADC: sensor=%u raw (%u mV), batt=%u raw (%u mV)",
-                 sensor_raw, saadc_raw_to_mv(sensor_raw),
-                 batt_raw, saadc_raw_to_mv(batt_raw));
+    NRF_LOG_INFO("ADC: batt=%u raw (%u mV)", batt_raw, saadc_raw_to_mv(batt_raw));
 }
 
 /* ==================================================================
