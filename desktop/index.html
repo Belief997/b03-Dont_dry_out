@@ -1,0 +1,934 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>sensor_beacon 上位机 — HX711 串口示波器</title>
+<style>
+  :root{
+    --bg:#0b0f14; --panel:#131a22; --panel2:#0e141b; --line:#233040;
+    --fg:#dbe6f0; --dim:#7c8fa3; --accent:#38bdf8;
+    --ch0:#4ade80; --ch1:#60a5fa; --ch2:#f472b6;
+    --ok:#22c55e; --warn:#f59e0b; --err:#ef4444;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0; background:var(--bg); color:var(--fg);
+    font:13px/1.5 "Consolas","JetBrains Mono",Menlo,"Microsoft YaHei",monospace;
+    display:flex; flex-direction:column; overflow:hidden;
+  }
+  button,select,input{
+    font:inherit; color:var(--fg); background:var(--panel2);
+    border:1px solid var(--line); border-radius:4px; padding:4px 8px;
+  }
+  button{cursor:pointer}
+  button:hover:not(:disabled){border-color:var(--accent)}
+  button:disabled{opacity:.4; cursor:not-allowed}
+  button.primary{background:#0c4a6e; border-color:#0ea5e9}
+  button.danger{background:#4c1d1d; border-color:#ef4444}
+  input[type=text],input[type=number]{background:#0a0f14}
+  label{color:var(--dim)}
+
+  /* ---------- 顶栏 ---------- */
+  header{
+    display:flex; flex-wrap:wrap; gap:8px; align-items:center;
+    padding:8px 12px; background:var(--panel); border-bottom:1px solid var(--line);
+    flex:none;
+  }
+  header .title{font-weight:bold; color:var(--accent); margin-right:4px}
+  header .sep{width:1px; height:22px; background:var(--line); margin:0 4px}
+  header .spacer{flex:1}
+  #status{
+    display:inline-flex; align-items:center; gap:6px;
+    padding:3px 10px; border-radius:999px; background:var(--panel2);
+    border:1px solid var(--line);
+  }
+  #dot{width:8px;height:8px;border-radius:50%;background:var(--dim)}
+  #dot.on{background:var(--ok); box-shadow:0 0 8px var(--ok)}
+  #dot.sim{background:var(--warn); box-shadow:0 0 8px var(--warn)}
+  #dot.err{background:var(--err)}
+
+  /* ---------- 主体 ---------- */
+  main{flex:1; display:flex; min-height:0}
+  #scopes{flex:1; display:flex; flex-direction:column; min-width:0; padding:8px; gap:8px}
+  .pane{
+    flex:1; min-height:0; background:var(--panel2);
+    border:1px solid var(--line); border-radius:6px;
+    display:flex; flex-direction:column; overflow:hidden;
+  }
+  .pane-head{
+    display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+    padding:4px 10px; background:var(--panel); border-bottom:1px solid var(--line);
+    flex:none; font-size:12px;
+  }
+  .pane-head .name{font-weight:bold}
+  .pane-head .gain{
+    color:var(--dim); border:1px solid var(--line);
+    border-radius:3px; padding:0 5px; font-size:11px;
+  }
+  .pane-head .stat{color:var(--dim)}
+  .pane-head .stat b{color:var(--fg); font-weight:normal}
+  .pane-head .avg-stat b{color:#f8fafc}
+  .pane-head .avg-stat i{color:var(--warn); font-style:normal; margin-left:3px; font-size:11px}
+  .pane-head .grow{flex:1}
+  .pane canvas{flex:1; width:100%; display:block; min-height:0}
+
+  .legend{display:inline-flex; align-items:center; gap:4px; font-size:11px; color:var(--dim)}
+  .legend i.sw-avg{width:16px; height:0; border-top:1.5px solid #f8fafc; display:inline-block}
+  .legend i.sw-avg.dash{border-top-style:dashed}
+
+  /* ---------- 侧栏 ---------- */
+  aside{
+    width:400px; flex:none; display:flex; flex-direction:column;
+    border-left:1px solid var(--line); background:var(--panel); min-height:0;
+  }
+  aside .sec{border-bottom:1px solid var(--line); padding:8px 10px; flex:none}
+  aside .sec h3{
+    margin:0 0 6px; font-size:11px; text-transform:uppercase;
+    letter-spacing:.08em; color:var(--dim); font-weight:normal;
+  }
+  .row{display:flex; gap:6px; align-items:center; margin-bottom:6px; flex-wrap:wrap}
+  .row:last-child{margin-bottom:0}
+  .row > input[type=text]{flex:1; min-width:0}
+  .grid2{display:grid; grid-template-columns:auto 1fr; gap:4px 8px; align-items:center}
+
+  #logWrap{flex:1; display:flex; flex-direction:column; min-height:0; padding:8px 10px}
+  #log{
+    flex:1; overflow-y:auto; background:#080c11; border:1px solid var(--line);
+    border-radius:4px; padding:6px 8px; font-size:11.5px; white-space:pre-wrap;
+    word-break:break-all; min-height:0;
+  }
+  #log .l{color:#93a4b5}
+  #log .l.hit{color:#a7f3d0}
+  #log .l.sys{color:var(--warn)}
+  #log .l.bad{color:#fca5a5}
+  .counts{display:flex; gap:12px; font-size:11px; color:var(--dim); margin-top:6px}
+  .counts b{color:var(--fg); font-weight:normal}
+
+  details.help{padding:8px 10px; border-bottom:1px solid var(--line)}
+  details.help summary{cursor:pointer; color:var(--dim); font-size:11px; letter-spacing:.06em; text-transform:uppercase}
+  details.help div{margin-top:8px; color:#9fb0c2; font-size:12px}
+  details.help code{background:#0a0f14; padding:1px 4px; border-radius:3px; color:#a7f3d0}
+  details.help ol{margin:6px 0; padding-left:20px}
+  details.help li{margin:3px 0}
+
+  #banner{
+    display:none; padding:8px 12px; background:#4c1d1d;
+    border-bottom:1px solid var(--err); color:#fecaca; flex:none;
+  }
+</style>
+</head>
+<body>
+
+<div id="banner"></div>
+
+<header>
+  <span class="title">HX711 串口示波器</span>
+  <span class="sep"></span>
+
+  <button id="btnConnect" class="primary">选择串口并连接</button>
+  <button id="btnDisconnect" disabled>断开</button>
+
+  <label>波特率
+    <select id="baud">
+      <option>9600</option><option>19200</option><option>38400</option>
+      <option>57600</option><option selected>115200</option>
+      <option>230400</option><option>460800</option><option>921600</option>
+    </select>
+  </label>
+
+  <span class="sep"></span>
+
+  <label>时间窗
+    <select id="window">
+      <option value="5000">5 s</option>
+      <option value="10000" selected>10 s</option>
+      <option value="20000">20 s</option>
+      <option value="30000">30 s</option>
+      <option value="60000">60 s</option>
+    </select>
+  </label>
+
+  <label>数据源
+    <select id="source">
+      <option value="raw" selected>raw(原始值)</option>
+      <option value="avg">avg(滑动平均)</option>
+    </select>
+  </label>
+
+  <button id="btnPause">暂停</button>
+  <button id="btnClear">清空</button>
+  <button id="btnCsv">导出 CSV</button>
+
+  <span class="spacer"></span>
+
+  <button id="btnSim">模拟数据</button>
+  <span id="status"><span id="dot"></span><span id="statusText">未连接</span></span>
+</header>
+
+<main>
+  <div id="scopes"></div>
+
+  <aside>
+    <div class="sec">
+      <h3>通道显示</h3>
+      <div class="row">
+        <label><input type="checkbox" id="autoscale" checked> 自动量程</label>
+        <label><input type="checkbox" id="showDots" checked> 标记新帧</label>
+      </div>
+      <div class="row">
+        <label title="白色阶梯线 = 滑动平均。仅新帧入窗,与固件 ma_push() 一致">
+          <input type="checkbox" id="showAvg" checked> 显示滑动平均
+        </label>
+        <span class="legend"><i class="sw-avg"></i>实线=窗口已满</span>
+        <span class="legend"><i class="sw-avg dash"></i>虚线=未满</span>
+      </div>
+      <div class="row">
+        <label>窗口
+          <input type="number" id="maSize" value="10" min="1" max="200" step="1" style="width:64px">
+        </label>
+        <span style="color:var(--dim);font-size:11px">
+          样本数(固件 MA_WINDOW_SIZE=10)
+        </span>
+      </div>
+      <div class="row">
+        <label title="把 chB(增益32) 的读数 ×4 折算到增益128 的等效刻度,便于三通道同尺度比较">
+          <input type="checkbox" id="normGain"> 按增益归一化(chB ×4)
+        </label>
+      </div>
+    </div>
+
+    <div class="sec">
+      <h3>解析规则</h3>
+      <div class="row">
+        <input type="text" id="regex" spellcheck="false">
+      </div>
+      <div class="row">
+        <span style="color:var(--dim);font-size:11px">
+          捕获组顺序: 1=类型(raw/avg) 2=ch0 3=ch1 4=ch2 5=n1 6=n2(后两组可选)
+        </span>
+      </div>
+      <div class="row">
+        <button id="btnRegexReset">恢复默认</button>
+        <span id="regexState" style="font-size:11px"></span>
+      </div>
+    </div>
+
+    <div class="sec">
+      <h3>日志</h3>
+      <div class="row">
+        <label><input type="checkbox" id="autoscroll" checked> 自动滚动</label>
+        <label><input type="checkbox" id="onlyHit"> 仅显示已解析行</label>
+      </div>
+    </div>
+
+    <details class="help">
+      <summary>使用说明 / 排查</summary>
+      <div>
+        <ol>
+          <li>需 <b>Chrome / Edge 89+</b>(Web Serial API)。Firefox / Safari 不支持。</li>
+          <li>本页可直接以 <code>file://</code> 打开;若浏览器拒绝,用
+              <code>python -m http.server</code> 后访问 <code>localhost</code>。</li>
+          <li>设备日志走 UART: <b>TX = P0.06, 115200 8N1</b>
+              (来自 <code>sdk_config.h</code>)。DK 板经板载 CH340/J-Link CDC 虚拟串口输出。</li>
+          <li>串口是<b>独占</b>的 —— 先关掉 RTT Viewer / 串口助手 / nRF Connect,否则连不上。</li>
+          <li>点"模拟数据"可在无硬件时验证解析与绘图。</li>
+        </ol>
+        <div style="margin-top:8px">
+          <b>波形为何呈阶梯状?</b> 固件每 100ms 打印一行,但 HX711 并非每次都有新值。
+          曲线按"采样保持"绘制(保持上一已知值),实心点标记真正的新帧。
+          #1 在 A/B 批次切换处需约 400ms 重新稳定,会出现明显平台段,属正常现象。
+        </div>
+        <div style="margin-top:8px">
+          <b>三通道增益不同:</b> ch0/ch2 = 128,ch1(chB) 硬件固定 = 32。
+          原始计数不可直接横向比较,勾选"按增益归一化"可折算到同一尺度。
+        </div>
+        <div style="margin-top:8px">
+          <b>白色阶梯线 = 网页端算的滑动平均。</b>
+          规则与固件 <code>ma_push()</code> 一致 —— <b>只有新帧入窗</b>,
+          未就绪 tick 重复打印的保持值不计入(否则停留越久的值权重越大,
+          结果会和设备端不符)。窗口未满时画虚线,对应固件
+          <code>ma_ready()</code> 为假、平均尚不可信的阶段,头部同时显示
+          <code>(n/窗口)</code> 进度。
+        </div>
+        <div style="margin-top:8px">
+          ⚠ 数据源选 <code>avg</code> 时,设备端已做过一次平均,此处再平均
+          等于<b>二次滤波</b>,响应会更迟钝。想比对网页与固件的算法是否一致,
+          应选 <code>raw</code> 看白线,再切到 <code>avg</code> 看固件输出,
+          两者应当接近(固件为整数除法,有 ±1 量级的舍入差)。
+        </div>
+      </div>
+    </details>
+
+    <div id="logWrap">
+      <div id="log"></div>
+      <div class="counts">
+        <span>接收 <b id="cLines">0</b> 行</span>
+        <span>解析 <b id="cParsed">0</b></span>
+        <span>丢弃 <b id="cSkip">0</b></span>
+        <span><b id="cRate">0</b> 行/s</span>
+      </div>
+    </div>
+  </aside>
+</main>
+
+<script>
+"use strict";
+
+/* ==================================================================
+ *  通道定义
+ *  与 main.c 的负载语义一致: ch0=#1 chA, ch1=#1 chB, ch2=#2 chA
+ *  增益由硬件决定: chA 可 128/64(本工程用 128), chB 固定 32 不可改
+ * ================================================================== */
+const CHANNELS = [
+  { key:'ch0', name:'#1 Channel A', gain:128, color:'#4ade80' },
+  { key:'ch1', name:'#1 Channel B', gain:32,  color:'#60a5fa' },
+  { key:'ch2', name:'#2 Channel A', gain:128, color:'#f472b6' },
+];
+
+/* 默认解析规则 —— 对应 main.c 中的两条日志格式串:
+ *   "HX711 raw:  1:chA=%6ld chB=%6ld  2:chA=%6ld [n=%u%u]"
+ *   "HX711 avg:  1:chA=%6ld chB=%6ld  2:chA=%6ld"
+ * %6ld 会产生右对齐空格填充, 故各处允许可变空白。 */
+const DEFAULT_REGEX =
+  "HX711\\s+(raw|avg):\\s*1:chA=\\s*(-?\\d+)\\s+chB=\\s*(-?\\d+)\\s+2:chA=\\s*(-?\\d+)(?:\\s*\\[n=(\\d)(\\d)\\])?";
+
+const MAX_POINTS  = 60000;   /* 每通道保留点数上限 */
+const MAX_RECORDS = 200000;  /* CSV 记录上限 */
+const MAX_LOG_DOM = 400;     /* 日志区保留的 DOM 行数 */
+
+/* ==================================================================
+ *  状态
+ * ================================================================== */
+const state = {
+  port:null, reader:null, keepReading:false,
+  paused:false, sim:null, simTimer:null,
+  t0:performance.now(),
+  buffers:{ ch0:[], ch1:[], ch2:[] },   /* {t,v,isNew,avg,n} */
+  maWin:{ ch0:[], ch1:[], ch2:[] },     /* 滑动平均窗口(仅新帧入窗) */
+  maSize:10,                            /* 与固件 MA_WINDOW_SIZE 一致 */
+  records:[],                            /* CSV 用 */
+  counts:{ lines:0, parsed:0, skip:0 },
+  rateWin:[],                            /* 行速率滑窗 */
+  re:null,
+};
+
+const $ = id => document.getElementById(id);
+const now = () => performance.now() - state.t0;
+
+/* ==================================================================
+ *  示波器面板
+ * ================================================================== */
+class Scope {
+  constructor(ch){
+    this.ch = ch;
+    this.scale = null;            /* {min,max} 平滑后的显示量程 */
+
+    const pane = document.createElement('div');
+    pane.className = 'pane';
+    pane.innerHTML = `
+      <div class="pane-head">
+        <span class="name" style="color:${ch.color}">${ch.name}</span>
+        <span class="gain">增益 ${ch.gain}</span>
+        <span class="stat">当前 <b class="v-cur">—</b></span>
+        <span class="stat avg-stat">平均 <b class="v-avg">—</b><i class="v-avgn"></i></span>
+        <span class="stat">峰峰 <b class="v-pp">—</b></span>
+        <span class="stat">最小 <b class="v-min">—</b></span>
+        <span class="stat">最大 <b class="v-max">—</b></span>
+        <span class="grow"></span>
+        <span class="stat">更新 <b class="v-hz">—</b> Hz</span>
+      </div>
+      <canvas></canvas>`;
+    $('scopes').appendChild(pane);
+
+    this.canvas = pane.querySelector('canvas');
+    this.ctx    = this.canvas.getContext('2d');
+    this.el = {
+      cur:pane.querySelector('.v-cur'), pp:pane.querySelector('.v-pp'),
+      min:pane.querySelector('.v-min'), max:pane.querySelector('.v-max'),
+      hz :pane.querySelector('.v-hz'),
+      avg:pane.querySelector('.v-avg'), avgN:pane.querySelector('.v-avgn'),
+    };
+  }
+
+  /* 按增益折算(可选) */
+  conv(v){
+    if (!$('normGain').checked) return v;
+    return v * (128 / this.ch.gain);
+  }
+
+  resize(){
+    const dpr = window.devicePixelRatio || 1;
+    const w = this.canvas.clientWidth, h = this.canvas.clientHeight;
+    if (w === 0 || h === 0) return false;
+    if (this.canvas.width !== Math.round(w*dpr) || this.canvas.height !== Math.round(h*dpr)){
+      this.canvas.width  = Math.round(w*dpr);
+      this.canvas.height = Math.round(h*dpr);
+    }
+    this.ctx.setTransform(dpr,0,0,dpr,0,0);
+    this.W = w; this.H = h;
+    return true;
+  }
+
+  draw(tNow, windowMs){
+    if (!this.resize()) return;
+    const {ctx,W,H} = this;
+    const buf = state.buffers[this.ch.key];
+    const tMin = tNow - windowMs;
+
+    ctx.clearRect(0,0,W,H);
+
+    /* --- 可见样本 --- */
+    let i0 = buf.length;
+    while (i0 > 0 && buf[i0-1].t >= tMin) i0--;
+    if (i0 > 0) i0--;                     /* 多取一点以便左边界连线 */
+    const vis = buf.slice(i0);
+
+    /* --- 量程(含平均线, 否则平均线可能被削出画面) --- */
+    const showAvg = $('showAvg').checked;
+    let lo=Infinity, hi=-Infinity;
+    for (const p of vis){
+      const v=this.conv(p.v); if(v<lo)lo=v; if(v>hi)hi=v;
+      if (showAvg && p.avg !== null){
+        const a=this.conv(p.avg); if(a<lo)lo=a; if(a>hi)hi=a;
+      }
+    }
+    if (!isFinite(lo)){ lo=-1; hi=1; }
+    if (hi-lo < 1e-9){ lo-=1; hi+=1; }
+    const pad = (hi-lo)*0.12; lo-=pad; hi+=pad;
+
+    if ($('autoscale').checked){
+      /* 平滑趋近目标量程, 避免抖动 */
+      if (!this.scale) this.scale = {min:lo, max:hi};
+      else {
+        const k = 0.15;
+        this.scale.min += (lo - this.scale.min)*k;
+        this.scale.max += (hi - this.scale.max)*k;
+        /* 目标超出当前范围时立即跟上, 防止削顶 */
+        if (lo < this.scale.min) this.scale.min = lo;
+        if (hi > this.scale.max) this.scale.max = hi;
+      }
+    } else if (!this.scale){
+      this.scale = {min:lo, max:hi};
+    }
+    const {min:sLo, max:sHi} = this.scale;
+    const span = (sHi - sLo) || 1;
+
+    const xOf = t => W - (tNow - t)/windowMs * W;
+    const yOf = v => H - (v - sLo)/span * H;
+
+    /* --- 网格 --- */
+    ctx.strokeStyle = 'rgba(56,189,248,.10)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let g=0; g<=10; g++){
+      const x = Math.round(W*g/10)+.5;
+      ctx.moveTo(x,0); ctx.lineTo(x,H);
+    }
+    for (let g=0; g<=4; g++){
+      const y = Math.round(H*g/4)+.5;
+      ctx.moveTo(0,y); ctx.lineTo(W,y);
+    }
+    ctx.stroke();
+
+    /* --- 纵轴刻度 --- */
+    ctx.fillStyle = '#5a6f85';
+    ctx.font = '10px Consolas,monospace';
+    ctx.textBaseline = 'middle';
+    for (let g=0; g<=4; g++){
+      const v = sHi - span*g/4;
+      ctx.fillText(fmt(v), 4, Math.round(H*g/4) + (g===0?7:(g===4?-7:0)));
+    }
+    /* --- 横轴刻度(秒) --- */
+    ctx.textBaseline = 'bottom';
+    for (let g=0; g<=5; g++){
+      const secAgo = windowMs/1000 * (1 - g/5);
+      const x = W*g/5;
+      ctx.fillText(secAgo===0 ? '0s' : `-${secAgo.toFixed(0)}s`,
+                   Math.min(x+3, W-24), H-2);
+    }
+
+    if (vis.length === 0) return;
+
+    /* --- 采样保持波形 ---
+     * 固件每 tick 都打印, 但未必有新帧; 用阶梯线表示"保持上一已知值",
+     * 不虚构中间过程。切通道的 ~400ms 空档会显示为平台段。 */
+    ctx.strokeStyle = this.ch.color;
+    ctx.lineWidth = 1.6;
+    ctx.lineJoin = 'round';
+    ctx.beginPath();
+    let px=null, py=null;
+    for (const p of vis){
+      const x = xOf(p.t), y = yOf(this.conv(p.v));
+      if (px === null){ ctx.moveTo(x,y); }
+      else { ctx.lineTo(x,py); ctx.lineTo(x,y); }   /* 阶梯 */
+      px=x; py=y;
+    }
+    ctx.lineTo(W, py);      /* 延伸到右边界 = 当前时刻 */
+    ctx.stroke();
+
+    /* --- 滑动平均线 ---
+     * 与原始波形同为阶梯: 平均值只在新帧入窗时才变化, 保持段内是常量,
+     * 画成斜线会虚构出不存在的过渡。窗口未满(n<maSize)时用虚线提示
+     * "此段平均尚不可信", 对应固件 ma_ready() 为假的阶段。
+     *
+     * 实线/虚线交界处必须先把水平段画到交界点 x, 再从 (x,ay) 起笔换线型,
+     * 否则新笔画会从上一个点直接斜拉到当前点, 出现不存在的斜线。 */
+    if (showAvg){
+      const pts = [];
+      for (const p of vis){
+        if (p.avg === null) continue;          /* 首个新帧之前无平均值 */
+        pts.push({ x:xOf(p.t), y:yOf(this.conv(p.avg)), full:(p.n >= state.maSize) });
+      }
+
+      if (pts.length){
+        ctx.strokeStyle = '#f8fafc';
+        ctx.lineWidth = 1.3;
+        ctx.lineJoin = 'round';
+
+        let i = 0;
+        while (i < pts.length){
+          const full = pts[i].full;
+          ctx.setLineDash(full ? [] : [4,3]);
+          ctx.beginPath();
+          /* 本段起点: 首段从自身起笔, 后续段从交界点(上一段末值高度)起笔 */
+          if (i === 0) ctx.moveTo(pts[0].x, pts[0].y);
+          else         ctx.moveTo(pts[i].x, pts[i-1].y);
+
+          let y = (i === 0) ? pts[0].y : pts[i-1].y;
+          let j = i;
+          while (j < pts.length && pts[j].full === full){
+            ctx.lineTo(pts[j].x, y);           /* 水平保持 */
+            ctx.lineTo(pts[j].x, pts[j].y);    /* 垂直跳变 */
+            y = pts[j].y;
+            j++;
+          }
+          if (j < pts.length) ctx.lineTo(pts[j].x, y);  /* 画到交界点 */
+          else                ctx.lineTo(W, y);          /* 末段延伸到当前时刻 */
+          ctx.stroke();
+          i = j;
+        }
+        ctx.setLineDash([]);
+      }
+    }
+
+    /* --- 新帧标记 --- */
+    if ($('showDots').checked){
+      ctx.fillStyle = this.ch.color;
+      for (const p of vis){
+        if (!p.isNew) continue;
+        const x = xOf(p.t), y = yOf(this.conv(p.v));
+        ctx.beginPath(); ctx.arc(x,y,2.2,0,6.284); ctx.fill();
+      }
+    }
+
+    /* --- 当前值光标 --- */
+    const last = vis[vis.length-1];
+    const ly = yOf(this.conv(last.v));
+    ctx.strokeStyle = this.ch.color + '66';
+    ctx.setLineDash([3,3]); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(0,ly); ctx.lineTo(W,ly); ctx.stroke();
+    ctx.setLineDash([]);
+
+    /* --- 统计 --- */
+    let mn=Infinity, mx=-Infinity, newCnt=0;
+    const hzWin = 3000;
+    for (const p of vis){
+      const v = this.conv(p.v);
+      if (v<mn) mn=v; if (v>mx) mx=v;
+      if (p.isNew && p.t >= tNow-hzWin) newCnt++;
+    }
+    this.el.cur.textContent = fmt(this.conv(last.v));
+    this.el.min.textContent = fmt(mn);
+    this.el.max.textContent = fmt(mx);
+    this.el.pp .textContent = fmt(mx-mn);
+    this.el.hz .textContent = (newCnt / (Math.min(hzWin, windowMs)/1000)).toFixed(1);
+
+    /* 平均值 + 窗口填充进度(n/size), 未满时以进度形式提示 */
+    if (last.avg !== null){
+      this.el.avg.textContent = fmt(this.conv(last.avg));
+      this.el.avgN.textContent = (last.n >= state.maSize)
+                                 ? '' : `(${last.n}/${state.maSize})`;
+    } else {
+      this.el.avg.textContent = '—';
+      this.el.avgN.textContent = '';
+    }
+  }
+}
+
+function fmt(v){
+  if (!isFinite(v)) return '—';
+  const a = Math.abs(v);
+  if (a >= 1e6) return (v/1e6).toFixed(2)+'M';
+  if (a >= 1e4) return Math.round(v).toLocaleString('en-US');
+  if (a >= 100) return Math.round(v).toString();
+  return v.toFixed(a<1 ? 3 : 1);
+}
+
+const scopes = CHANNELS.map(ch => new Scope(ch));
+
+/* ==================================================================
+ *  数据入库
+ * ================================================================== */
+function pushSample(key, t, v, flagNew){
+  const buf = state.buffers[key];
+  const last = buf.length ? buf[buf.length-1] : null;
+  const changed = !last || last.v !== v;
+  /* flagNew 为固件的 [n=..] 标志。#1 的 n1 同时覆盖 chA/chB,
+   * 故还须比对数值变化才能判定"本行更新的是哪一个通道"。
+   * 局限: 新值与旧值完全相同时无法识别, 会漏一个标记点(不影响波形)。 */
+  const isNew = (flagNew === undefined) ? changed : (flagNew && changed);
+
+  /* 滑动平均 —— 复刻固件 ma_push() 的语义(main.c 的 ma_filter_t):
+   *   ⚠ 只有"新帧"才入窗。固件的 ma_push() 仅在读到新帧时调用, 保持值
+   *     (未就绪 tick 重复打印的旧值)不会入窗。若把每行都计入, 停留越久
+   *     的值权重越大, 结果与设备端不一致。
+   *   窗口未满时按实际样本数求平均, 与 ma_avg() 的 sum/count 一致。 */
+  const w = state.maWin[key];
+  if (isNew){
+    w.push(v);
+    if (w.length > state.maSize) w.splice(0, w.length - state.maSize);
+  }
+  let avg = null;
+  if (w.length){
+    let s = 0;
+    for (const x of w) s += x;
+    avg = s / w.length;          /* 固件为整数除法, 此处保留小数以便观察 */
+  }
+
+  buf.push({ t, v, isNew, avg, n:w.length });
+  if (buf.length > MAX_POINTS) buf.splice(0, buf.length - MAX_POINTS);
+}
+
+function handleLine(line){
+  state.counts.lines++;
+  state.rateWin.push(performance.now());
+
+  let m = null;
+  try { m = state.re ? state.re.exec(line) : null; } catch(e){ m = null; }
+
+  if (!m){
+    state.counts.skip++;
+    addLog(line, /boot|running|error|assert/i.test(line) ? 'sys' : '');
+    return;
+  }
+
+  const kind = m[1];
+  if (kind !== $('source').value){   /* 只采用选定的数据源 */
+    addLog(line, '');
+    return;
+  }
+
+  const t  = now();
+  const v0 = parseInt(m[2],10), v1 = parseInt(m[3],10), v2 = parseInt(m[4],10);
+  if (!isFinite(v0)||!isFinite(v1)||!isFinite(v2)){
+    state.counts.skip++; addLog(line,'bad'); return;
+  }
+
+  const n1 = m[5] !== undefined ? (m[5] === '1') : undefined;
+  const n2 = m[6] !== undefined ? (m[6] === '1') : undefined;
+
+  pushSample('ch0', t, v0, n1);
+  pushSample('ch1', t, v1, n1);
+  pushSample('ch2', t, v2, n2);
+
+  state.records.push([Math.round(t), v0, v1, v2,
+                      n1===undefined?'':(n1?1:0), n2===undefined?'':(n2?1:0),
+                      state.buffers.ch0.length ? state.buffers.ch0[state.buffers.ch0.length-1].avg : null,
+                      state.buffers.ch1.length ? state.buffers.ch1[state.buffers.ch1.length-1].avg : null,
+                      state.buffers.ch2.length ? state.buffers.ch2[state.buffers.ch2.length-1].avg : null]);
+  if (state.records.length > MAX_RECORDS)
+    state.records.splice(0, state.records.length - MAX_RECORDS);
+
+  state.counts.parsed++;
+  addLog(line, 'hit');
+}
+
+/* 窗口大小改变后, 按新窗口重算已存历史的平均值。
+ * 不重算的话旧点会保留按旧窗口算出的值, 曲线出现前后不一致的接缝。
+ * 重放时沿用各点已判定的 isNew, 与实时路径的入窗规则保持一致。 */
+function recomputeAverages(){
+  const size = state.maSize;
+  for (const key in state.buffers){
+    const buf = state.buffers[key];
+    const w = [];
+    for (const p of buf){
+      if (p.isNew){
+        w.push(p.v);
+        if (w.length > size) w.splice(0, w.length - size);
+      }
+      if (w.length){
+        let s = 0;
+        for (const x of w) s += x;
+        p.avg = s / w.length;
+      } else {
+        p.avg = null;
+      }
+      p.n = w.length;
+    }
+    state.maWin[key] = w;      /* 承接实时路径, 避免下一帧从空窗重来 */
+  }
+}
+
+/* ==================================================================
+ *  日志区
+ * ================================================================== */
+const logEl = $('log');
+function addLog(text, cls){
+  if ($('onlyHit').checked && cls !== 'hit') return;
+  const d = document.createElement('div');
+  d.className = 'l' + (cls ? ' '+cls : '');
+  d.textContent = text;
+  logEl.appendChild(d);
+  while (logEl.childElementCount > MAX_LOG_DOM) logEl.removeChild(logEl.firstChild);
+  if ($('autoscroll').checked) logEl.scrollTop = logEl.scrollHeight;
+}
+
+function setStatus(text, cls){
+  $('statusText').textContent = text;
+  $('dot').className = cls || '';
+}
+function banner(msg){
+  const b = $('banner');
+  if (!msg){ b.style.display='none'; return; }
+  b.style.display='block'; b.textContent = msg;
+}
+
+/* ==================================================================
+ *  串口
+ * ================================================================== */
+async function connect(){
+  if (!('serial' in navigator)){
+    banner('此浏览器不支持 Web Serial API。请使用 Chrome / Edge 89+,'
+          +'或点击"模拟数据"离线查看界面。');
+    return;
+  }
+  try{
+    const port = await navigator.serial.requestPort();
+    await port.open({
+      baudRate: parseInt($('baud').value,10),
+      dataBits:8, stopBits:1, parity:'none', flowControl:'none',
+    });
+    state.port = port;
+    state.keepReading = true;
+    banner('');
+    setStatus(`已连接 @ ${$('baud').value}`, 'on');
+    $('btnConnect').disabled = true;
+    $('btnDisconnect').disabled = false;
+    stopSim();
+    readLoop();
+  } catch(e){
+    if (e && e.name === 'NotFoundError'){ setStatus('未选择串口',''); return; }
+    setStatus('连接失败','err');
+    banner('打开串口失败: ' + (e && e.message ? e.message : e)
+          + ' —— 串口是独占的,请先关闭 RTT Viewer / 串口助手 / nRF Connect 等占用程序。');
+  }
+}
+
+async function readLoop(){
+  const decoder = new TextDecoderStream();
+  const closed = state.port.readable.pipeTo(decoder.writable).catch(()=>{});
+  const reader = decoder.readable.getReader();
+  state.reader = reader;
+
+  let buf = '';
+  try{
+    while (state.keepReading){
+      const {value, done} = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      buf += value;
+      /* 兼容 \r\n / \n / \r */
+      const parts = buf.split(/\r\n|\n|\r/);
+      buf = parts.pop();
+      if (!state.paused) for (const p of parts) if (p.length) handleLine(p);
+      /* 防御: 无换行的超长垃圾数据 */
+      if (buf.length > 8192) buf = buf.slice(-1024);
+    }
+  } catch(e){
+    if (state.keepReading){
+      setStatus('读取中断','err');
+      banner('串口读取中断: ' + (e && e.message ? e.message : e) + '(设备是否已拔出?)');
+    }
+  } finally {
+    try{ reader.releaseLock(); }catch(e){}
+    await closed;
+  }
+}
+
+async function disconnect(){
+  state.keepReading = false;
+  try{ if (state.reader) await state.reader.cancel(); }catch(e){}
+  try{ if (state.port) await state.port.close(); }catch(e){}
+  state.port = null; state.reader = null;
+  setStatus('未连接','');
+  $('btnConnect').disabled = false;
+  $('btnDisconnect').disabled = true;
+}
+
+/* ==================================================================
+ *  模拟数据 —— 无硬件时验证解析与绘图
+ *  复现真实时序: 单通道 ~100ms/帧; #1 每批 10 帧后切换, 切换需 ~400ms 稳定
+ * ================================================================== */
+function startSim(){
+  disconnect();
+  const s = {
+    target:'A', idx:0, switched:false, waitUntil:0,
+    v1a:37836, v1b:9960, v2a:-40395, t2:0, phase:0,
+  };
+  state.sim = s;
+  setStatus('模拟数据运行中','sim');
+  $('btnSim').textContent = '停止模拟';
+
+  state.simTimer = setInterval(()=>{
+    if (state.paused) return;
+    const t = now();
+    s.phase += 0.06;
+
+    let n1 = 0, n2 = 0;
+
+    /* --- #1: 批次状态机 --- */
+    if (t >= s.waitUntil){
+      if (s.switched === false){       /* 切换帧: 返回旧通道数据, 被丢弃 */
+        s.switched = true;
+        s.waitUntil = t + 100;
+      } else {
+        n1 = 1;
+        if (s.target === 'A'){
+          s.v1a = 37836 + Math.round(Math.sin(s.phase)*1800 + (Math.random()-.5)*260);
+        } else {
+          s.v1b = 9960 + Math.round(Math.sin(s.phase*0.8)*450 + (Math.random()-.5)*90);
+        }
+        s.idx++;
+        if (s.idx >= 10){
+          s.target = (s.target === 'A') ? 'B' : 'A';
+          s.idx = 0; s.switched = false;
+          s.waitUntil = t + 400;       /* 换道后 4 个输出周期 */
+        } else {
+          s.waitUntil = t + 100;
+        }
+      }
+    }
+
+    /* --- #2: 单通道满速 10Hz --- */
+    if (t >= s.t2){
+      n2 = 1;
+      s.v2a = -40395 + Math.round(Math.cos(s.phase*1.3)*2100 + (Math.random()-.5)*300);
+      s.t2 = t + 100;
+    }
+
+    const pad = (v,w) => String(v).padStart(w,' ');
+    handleLine(`HX711 raw:  1:chA=${pad(s.v1a,6)} chB=${pad(s.v1b,6)}`
+             + `  2:chA=${pad(s.v2a,6)} [n=${n1}${n2}]`);
+  }, 100);
+}
+function stopSim(){
+  if (state.simTimer){ clearInterval(state.simTimer); state.simTimer=null; }
+  state.sim = null;
+  $('btnSim').textContent = '模拟数据';
+  if (!state.port) setStatus('未连接','');
+}
+
+/* ==================================================================
+ *  其他控件
+ * ================================================================== */
+function compileRegex(){
+  const src = $('regex').value;
+  try{
+    state.re = new RegExp(src);
+    $('regexState').textContent = '✓ 规则有效';
+    $('regexState').style.color = 'var(--ok)';
+  } catch(e){
+    state.re = null;
+    $('regexState').textContent = '✗ ' + e.message;
+    $('regexState').style.color = 'var(--err)';
+  }
+}
+
+function clearData(){
+  for (const k in state.buffers) state.buffers[k] = [];
+  for (const k in state.maWin)   state.maWin[k]   = [];
+  state.records = [];
+  state.counts = { lines:0, parsed:0, skip:0 };
+  state.rateWin = [];
+  state.t0 = performance.now();
+  for (const sc of scopes) sc.scale = null;
+  logEl.textContent = '';
+}
+
+function exportCsv(){
+  if (!state.records.length){ banner('暂无数据可导出。'); setTimeout(()=>banner(''),2500); return; }
+  const head = 't_ms,ch0_1chA_g128,ch1_1chB_g32,ch2_2chA_g128,n1,n2,'
+             + 'ch0_avg,ch1_avg,ch2_avg\n';
+  const body = state.records.map(r =>
+    r.map(x => x === null ? '' : (typeof x === 'number' && !Number.isInteger(x) ? x.toFixed(2) : x))
+     .join(',')).join('\n');
+  const url = URL.createObjectURL(new Blob([head+body], {type:'text/csv'}));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'hx711_' + new Date().toISOString().replace(/[:.]/g,'-').slice(0,19) + '.csv';
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+$('btnConnect')   .onclick = connect;
+$('btnDisconnect').onclick = disconnect;
+$('btnClear')     .onclick = clearData;
+$('btnCsv')       .onclick = exportCsv;
+$('btnSim')       .onclick = () => state.simTimer ? stopSim() : startSim();
+$('btnPause')     .onclick = () => {
+  state.paused = !state.paused;
+  $('btnPause').textContent = state.paused ? '继续' : '暂停';
+  $('btnPause').className   = state.paused ? 'danger' : '';
+};
+$('btnRegexReset').onclick = () => { $('regex').value = DEFAULT_REGEX; compileRegex(); };
+$('regex').oninput = compileRegex;
+$('autoscale').onchange = () => { for (const sc of scopes) sc.scale = null; };
+$('normGain') .onchange = () => { for (const sc of scopes) sc.scale = null; };
+$('showAvg')  .onchange = () => { for (const sc of scopes) sc.scale = null; };
+$('maSize')   .onchange = () => {
+  const n = parseInt($('maSize').value, 10);
+  if (!isFinite(n) || n < 1){ $('maSize').value = state.maSize; return; }
+  state.maSize = Math.min(n, 200);
+  $('maSize').value = state.maSize;
+  recomputeAverages();
+  for (const sc of scopes) sc.scale = null;
+};
+
+/* 设备意外拔出 */
+if ('serial' in navigator){
+  navigator.serial.addEventListener('disconnect', () => {
+    if (state.port){ setStatus('设备已断开','err'); disconnect(); }
+  });
+}
+
+/* ==================================================================
+ *  渲染循环
+ * ================================================================== */
+function tick(){
+  const t = now();
+  const win = parseInt($('window').value,10);
+  for (const sc of scopes) sc.draw(t, win);
+
+  /* 行速率(近 2s) */
+  const cut = performance.now() - 2000;
+  while (state.rateWin.length && state.rateWin[0] < cut) state.rateWin.shift();
+  $('cLines') .textContent = state.counts.lines;
+  $('cParsed').textContent = state.counts.parsed;
+  $('cSkip')  .textContent = state.counts.skip;
+  $('cRate')  .textContent = (state.rateWin.length/2).toFixed(1);
+
+  requestAnimationFrame(tick);
+}
+
+$('regex').value = DEFAULT_REGEX;
+compileRegex();
+if (!('serial' in navigator)){
+  banner('此浏览器不支持 Web Serial API。请使用 Chrome / Edge 89+,'
+        +'或点击"模拟数据"离线查看界面。');
+}
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>
