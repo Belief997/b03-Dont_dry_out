@@ -82,7 +82,18 @@
   aside{
     width:400px; flex:none; display:flex; flex-direction:column;
     border-left:1px solid var(--line); background:var(--panel); min-height:0;
+    overflow-y:auto;                       /* 内容超高时侧栏整体滚动 */
+    scrollbar-width:thin;                  /* Firefox 细滚动条 */
+    scrollbar-color:var(--dim) transparent;
   }
+  /* WebKit(Chrome/Edge) 自定义滚动条: 宽、可拖动、悬停高亮 */
+  aside::-webkit-scrollbar{ width:12px }
+  aside::-webkit-scrollbar-track{ background:transparent }
+  aside::-webkit-scrollbar-thumb{
+    background:#2c3d50; border-radius:6px; border:3px solid var(--panel);
+  }
+  aside::-webkit-scrollbar-thumb:hover{ background:var(--accent) }
+  aside::-webkit-scrollbar-corner{ background:transparent }
   aside .sec{border-bottom:1px solid var(--line); padding:8px 10px; flex:none}
   aside .sec h3{
     margin:0 0 6px; font-size:11px; text-transform:uppercase;
@@ -93,7 +104,10 @@
   .row > input[type=text]{flex:1; min-width:0}
   .grid2{display:grid; grid-template-columns:auto 1fr; gap:4px 8px; align-items:center}
 
-  #logWrap{flex:1; display:flex; flex-direction:column; min-height:0; padding:8px 10px}
+  #logWrap{
+    flex:none; height:180px; display:flex; flex-direction:column;
+    min-height:0; padding:8px 10px;
+  }
   #log{
     flex:1; overflow-y:auto; background:#080c11; border:1px solid var(--line);
     border-radius:4px; padding:6px 8px; font-size:11.5px; white-space:pre-wrap;
@@ -117,6 +131,41 @@
     display:none; padding:8px 12px; background:#4c1d1d;
     border-bottom:1px solid var(--err); color:#fecaca; flex:none;
   }
+
+  /* ---------- 标定工具 ---------- */
+  details.cal{border-bottom:1px solid var(--line); padding:8px 10px}
+  details.cal summary{
+    cursor:pointer; color:var(--dim); font-size:11px;
+    letter-spacing:.06em; text-transform:uppercase;
+  }
+  details.cal summary:hover{color:var(--accent)}
+  .cal-body{margin-top:8px; font-size:12px; color:#9fb0c2}
+  .cal-body h4{
+    margin:12px 0 4px; font-size:11px; color:var(--accent);
+    letter-spacing:0; text-transform:none; font-weight:bold;
+  }
+  .cal-body h4:first-child{margin-top:0}
+  .cal-body .box{
+    background:#0a0f14; border:1px solid var(--line); border-radius:4px;
+    padding:4px 6px; min-height:18px; max-height:150px; overflow-y:auto;
+    word-break:break-all; white-space:pre-wrap; font-size:11.5px;
+  }
+  .cal-body .box div{padding:1px 0; border-bottom:1px dashed var(--line)}
+  .cal-body .box div:last-child{border-bottom:none}
+  .cal-body .box .rowitem{
+    display:flex; align-items:center; justify-content:space-between;
+    gap:6px; padding:1px 0; border-bottom:1px dashed var(--line);
+  }
+  .cal-body .box .rowitem:last-child{border-bottom:none}
+  .cal-body .xbtn{
+    flex:none; padding:0 5px; font-size:11px; line-height:1.4;
+    color:#fca5a5; background:transparent; border-color:transparent;
+    border-radius:3px;
+  }
+  .cal-body .xbtn:hover{border-color:var(--err); color:#fff}
+  .cal-body .box .err{color:#fca5a5}
+  .cal-body .kval{color:#a7f3d0; font-weight:bold}
+  .cal-body input[type=number]{width:88px}
 </style>
 </head>
 <body>
@@ -223,6 +272,58 @@
       </div>
     </div>
 
+    <details class="cal" id="calPanel">
+      <summary>标定工具(清零 / 采样 / 最小二乘 / 验算)</summary>
+      <div class="cal-body">
+        <div class="row" style="margin-top:2px">
+          <label>数据源
+            <select id="calSrc">
+              <option value="raw" selected>raw(原始值)</option>
+              <option value="avg">avg(滑动平均)</option>
+            </select>
+          </label>
+          <span style="color:var(--dim);font-size:11px">
+            作用于下面所有"采样"点击</span>
+          <span class="grow" style="flex:1"></span>
+          <button id="btnCalResetAll" class="danger" title="清空全部标定数据">全部重置</button>
+        </div>
+
+        <h4>① 清零 —— 空载时标定零点</h4>
+        <div class="row">
+          <button id="btnCalZero" class="primary">清零采样</button>
+          <button id="btnCalResetZero">重置</button>
+        </div>
+        <div class="box" id="calZeroView">尚未清零</div>
+
+        <h4>② 采样 —— 每个已知重量点点击一次</h4>
+        <div class="row">
+          <label>实际重量 W
+            <input type="number" id="calWeight" step="any" placeholder="g">
+          </label>
+          <button id="btnCalSample" class="primary">记录样本</button>
+          <button id="btnCalResetSamples">重置</button>
+        </div>
+        <div class="box" id="calSamples">无样本</div>
+
+        <h4>③ 最小二乘 —— 求解系数 k</h4>
+        <div class="row">
+          <button id="btnCalSolve" class="primary">计算系数 k</button>
+          <button id="btnCalResetK">重置</button>
+        </div>
+        <div class="box" id="calKView">未计算</div>
+
+        <h4>④ 验算 —— 新质量代入 k 求重量</h4>
+        <div class="row">
+          <label>实际重量 W
+            <input type="number" id="calVerW" step="any" placeholder="g">
+          </label>
+          <button id="btnCalVerify" class="primary">验算采样</button>
+          <button id="btnCalResetVerify">重置</button>
+        </div>
+        <div class="box" id="calVerifyView">—</div>
+      </div>
+    </details>
+
     <details class="help">
       <summary>使用说明 / 排查</summary>
       <div>
@@ -234,6 +335,9 @@
               (来自 <code>sdk_config.h</code>)。DK 板经板载 CH340/J-Link CDC 虚拟串口输出。</li>
           <li>串口是<b>独占</b>的 —— 先关掉 RTT Viewer / 串口助手 / nRF Connect,否则连不上。</li>
           <li>点"模拟数据"可在无硬件时验证解析与绘图。</li>
+          <li><b>标定工具</b>: 需至少 3 个不同重量点的样本, 且三个通道都要有
+              变化(否则矩阵奇异, 无法解出 k)。数据源选 avg 时须等滑动平均
+              窗口产生数值(白色虚线变为实线之后)再采样。</li>
         </ol>
         <div style="margin-top:8px">
           <b>波形为何呈阶梯状?</b> 固件每 100ms 打印一行,但 HX711 并非每次都有新值。
@@ -691,7 +795,11 @@ function setStatus(text, cls){
 }
 function banner(msg){
   const b = $('banner');
-  if (!msg){ b.style.display='none'; return; }
+  if (!msg){
+    b.style.display='none';
+    b.textContent = '';          /* 隐藏时同时清掉旧文案, 避免下次误读 */
+    return;
+  }
   b.style.display='block'; b.textContent = msg;
 }
 
@@ -871,6 +979,280 @@ function exportCsv(){
   a.click();
   URL.revokeObjectURL(url);
 }
+
+/* ==================================================================
+ *  标定工具
+ *  流程: ① 清零 → ② 多点采样(已知重量) → ③ 最小二乘求 k → ④ 验算
+ *  模型: W = k0·x0' + k1·x1' + k2·x2', 其中 x' = x − zero(逐通道)
+ * ================================================================== */
+state.cal = {
+  zero:null,        /* [x0,x1,x2] 清零值 */
+  samples:[],       /* {w, x:[..], src, wPred, res} */
+  k:null,           /* [k0,k1,k2] */
+  verifies:[],      /* {x:[..], src, wCalc, wReal, res, pct} */
+};
+
+/* 取三通道当前最新值(按 calSrc)。任一通道无数据/无平均值时返回 null */
+function calCurrent(){
+  const src = $('calSrc').value;
+  const keys = ['ch0','ch1','ch2'];
+  const out = [];
+  for (const key of keys){
+    const buf = state.buffers[key];
+    if (!buf.length) return null;
+    const last = buf[buf.length-1];
+    const v = (src === 'avg') ? last.avg : last.v;
+    if (v === null || v === undefined || !isFinite(v)) return null;
+    out.push(v);
+  }
+  return out;
+}
+
+/* 3x3 高斯消元解 A·x = b, 奇异时返回 null */
+function solve3x3(A, b){
+  const n = 3;
+  const M = A.map((r,i) => r.concat(b[i]));
+  for (let c=0; c<n; c++){
+    let p = c;
+    for (let r=c+1; r<n; r++)
+      if (Math.abs(M[r][c]) > Math.abs(M[p][c])) p = r;
+    if (Math.abs(M[p][c]) < 1e-12) return null;
+    if (p !== c){ const t=M[p]; M[p]=M[c]; M[c]=t; }
+    for (let r=c+1; r<n; r++){
+      const f = M[r][c] / M[c][c];
+      for (let k=c; k<=n; k++) M[r][k] -= f * M[c][k];
+    }
+  }
+  const x = [0,0,0];
+  for (let i=n-1; i>=0; i--){
+    let s = M[i][n];
+    for (let j=i+1; j<n; j++) s -= M[i][j] * x[j];
+    x[i] = s / M[i][i];
+  }
+  return x;
+}
+
+function calFmt(v){
+  if (v === null || v === undefined || !isFinite(v)) return '—';
+  const a = Math.abs(v);
+  if (a >= 1e6) return v.toExponential(3);
+  if (a >= 1000) return v.toFixed(1);
+  if (a >= 1) return v.toFixed(4);
+  return v.toExponential(3);
+}
+
+function renderCal(){
+  const cal = state.cal;
+
+  $('calZeroView').innerHTML = cal.zero
+    ? `<div class="rowitem">` +
+      `<span>zero = [ ${cal.zero.map(v=>Math.round(v)).join(', ')} ]</span>` +
+      `<button class="xbtn" onclick="calResetZero()" title="删除零点">✕</button></div>`
+    : '尚未清零';
+
+  const sEl = $('calSamples');
+  if (!cal.samples.length){
+    sEl.textContent = '无样本(至少 3 条不同重量)';
+  } else {
+    sEl.innerHTML = cal.samples.map((s,i)=>{
+      let tail = '';
+      if (s.wPred !== undefined){
+        tail = `  → 计算 ${calFmt(s.wPred)} / 残差 ${calFmt(s.res)}`;
+      }
+      return `<div class="rowitem">` +
+             `<span>#${i+1} W=${s.w}${s.src==='avg'?'(avg)':''}` +
+             ` x=[${s.x.map(v=>Math.round(v)).join(',')}]${tail}</span>` +
+             `<button class="xbtn" onclick="calDeleteSample(${i})" title="删除本条">✕</button></div>`;
+    }).join('');
+  }
+
+  const kEl = $('calKView');
+  if (cal.k){
+    kEl.innerHTML = '<span class="kval">k = [ ' +
+      cal.k.map(v=>v.toPrecision(6)).join(', ') + ' ]</span>';
+  } else {
+    kEl.textContent = '未计算(需 ≥3 条样本)';
+  }
+
+  const vEl = $('calVerifyView');
+  if (!cal.verifies.length){
+    vEl.textContent = '—';
+  } else {
+    vEl.innerHTML = cal.verifies.map((v,i)=>{
+      const pct = (isFinite(v.pct) && v.wReal !== 0)
+        ? v.pct.toFixed(3) + '%' : '—';
+      return `<div class="rowitem">` +
+             `<span>#${i+1} 计算 <b>${calFmt(v.wCalc)}</b> 实际 ${v.wReal}` +
+             ` 残差 ${calFmt(v.res)} 误差率 ${pct}${v.src==='avg'?' (avg)':''}</span>` +
+             `<button class="xbtn" onclick="calDeleteVerify(${i})" title="删除本条">✕</button></div>`;
+    }).join('');
+  }
+}
+
+/* ① 清零 */
+function calZero(){
+  const x = calCurrent();
+  if (!x){
+    banner('清零失败: ' + ($('calSrc').value==='avg'
+          ? '滑动平均尚未产生(窗口内无新帧), 可先改用 raw'
+          : '尚未收到任何已解析数据'));
+    return;
+  }
+  state.cal.zero = x.slice();
+  banner('');
+  renderCal();
+  addLog(`[标定] 清零: [${x.map(v=>Math.round(v)).join(', ')}]`, 'sys');
+}
+
+/* 将某个 .box 滚动到最底端(显示最新一条) */
+function scrollBoxBottom(id){
+  const el = $(id);
+  if (el) el.scrollTop = el.scrollHeight;
+}
+
+/* ② 记录一条已知重量样本 */
+function calSample(){
+  const w = parseFloat($('calWeight').value);
+  if (!isFinite(w)){
+    banner('请先在上方输入该样本的实际重量 W');
+    return;
+  }
+  const x = calCurrent();
+  if (!x){
+    banner('采样失败: ' + ($('calSrc').value==='avg'
+          ? '滑动平均尚未产生, 可先改用 raw' : '尚未收到任何已解析数据'));
+    return;
+  }
+  state.cal.samples.push({ w, x:x.slice(), src:$('calSrc').value });
+  /* 保留重量输入框的当前值, 便于同一重量连续采样/近似重量快速改一位 */
+  banner('');
+  renderCal();
+  scrollBoxBottom('calSamples');   /* 新样本入列后自动滚到最底端 */
+  addLog(`[标定] 样本 W=${w} x=[${x.map(v=>Math.round(v)).join(', ')}]`, 'sys');
+}
+
+/* ③ 最小二乘求解 k (A = 样本−零值, 正规方程 AᵀA·k = AᵀW) */
+function calSolve(){
+  const cal = state.cal;
+  if (!cal.zero){ banner('请先执行① 清零'); return; }
+  const S = cal.samples;
+  if (S.length < 3){
+    banner(`样本不足: 至少 3 条不同重量的样本(当前 ${S.length} 条)`);
+    return;
+  }
+  const A = S.map(s => [
+    s.x[0] - cal.zero[0],
+    s.x[1] - cal.zero[1],
+    s.x[2] - cal.zero[2],
+  ]);
+  const W = S.map(s => s.w);
+  const AtA = [[0,0,0],[0,0,0],[0,0,0]];
+  const AtW = [0,0,0];
+  for (let r=0; r<S.length; r++){
+    for (let i=0; i<3; i++){
+      AtW[i] += A[r][i] * W[r];
+      for (let j=0; j<3; j++) AtA[i][j] += A[r][i] * A[r][j];
+    }
+  }
+  const k = solve3x3(AtA, AtW);
+  if (!k){
+    banner('矩阵奇异: 样本区分度不足(重量相同/通道共线), 请补充不同位置的样本');
+    return;
+  }
+  cal.k = k;
+  let maxAbsRes = 0;
+  for (const s of S){
+    const x = [ s.x[0]-cal.zero[0], s.x[1]-cal.zero[1], s.x[2]-cal.zero[2] ];
+    s.wPred = k[0]*x[0] + k[1]*x[1] + k[2]*x[2];
+    s.res   = s.wPred - s.w;
+    if (Math.abs(s.res) > maxAbsRes) maxAbsRes = Math.abs(s.res);
+  }
+  banner('');
+  renderCal();
+  addLog(`[标定] k=[${k.map(v=>v.toPrecision(6)).join(', ')}] ` +
+         `最大|残差|=${calFmt(maxAbsRes)}`, 'sys');
+}
+
+/* ④ 验算: 新采样代入 k 求重量, 与用户输入的实际重量比残差 */
+function calVerify(){
+  const cal = state.cal;
+  if (!cal.k){ banner('请先完成③ 计算系数 k'); return; }
+  const wReal = parseFloat($('calVerW').value);
+  if (!isFinite(wReal)){
+    banner('请先输入该次验算的实际重量 W');
+    return;
+  }
+  const x = calCurrent();
+  if (!x){
+    banner('验算失败: ' + ($('calSrc').value==='avg'
+          ? '滑动平均尚未产生, 可先改用 raw' : '尚未收到任何已解析数据'));
+    return;
+  }
+  const dx = [ x[0]-cal.zero[0], x[1]-cal.zero[1], x[2]-cal.zero[2] ];
+  const wCalc = cal.k[0]*dx[0] + cal.k[1]*dx[1] + cal.k[2]*dx[2];
+  const res = wCalc - wReal;
+  const pct = (wReal !== 0) ? res / wReal * 100 : NaN;
+  cal.verifies.push({ x:x.slice(), src:$('calSrc').value,
+                      wCalc, wReal, res, pct });
+  /* 保留重量输入框的当前值, 与采样阶段一致, 便于连续验算 */
+  banner('');
+  renderCal();
+  scrollBoxBottom('calVerifyView');   /* 新验算记录入列后自动滚到最底端 */
+  addLog(`[验算] 计算=${calFmt(wCalc)} 实际=${wReal} 残差=${calFmt(res)}` +
+         (isFinite(pct) ? ` 误差率=${pct.toFixed(3)}%` : ''), 'sys');
+}
+
+/* ==================================================================
+ *  标定各阶段重置 / 全部重置
+ * ================================================================== */
+function calResetZero(){
+  state.cal.zero = null;
+  banner(''); renderCal();
+}
+function calResetSamples(){
+  state.cal.samples = [];
+  banner(''); renderCal();
+}
+function calResetK(){
+  state.cal.k = null;
+  /* 同时清掉样本上的回代结果, 与"未计算"状态保持一致 */
+  for (const s of state.cal.samples){ delete s.wPred; delete s.res; }
+  banner(''); renderCal();
+}
+function calResetVerify(){
+  state.cal.verifies = [];
+  banner(''); renderCal();
+}
+function calResetAll(){
+  state.cal = { zero:null, samples:[], k:null, verifies:[] };
+  $('calWeight').value = '';
+  $('calVerW').value  = '';
+  banner(''); renderCal();
+  addLog('[标定] 已全部重置', 'sys');
+}
+
+/* 单条删除(渲染行内 ✕ 按钮调用) */
+function calDeleteSample(i){
+  if (i < 0 || i >= state.cal.samples.length) return;
+  state.cal.samples.splice(i, 1);
+  banner(''); renderCal();
+}
+function calDeleteVerify(i){
+  if (i < 0 || i >= state.cal.verifies.length) return;
+  state.cal.verifies.splice(i, 1);
+  banner(''); renderCal();
+}
+
+$('btnCalZero')     .onclick = calZero;
+$('btnCalSample')   .onclick = calSample;
+$('btnCalSolve')    .onclick = calSolve;
+$('btnCalVerify')   .onclick = calVerify;
+$('btnCalResetAll')    .onclick = calResetAll;
+$('btnCalResetZero')   .onclick = calResetZero;
+$('btnCalResetSamples').onclick = calResetSamples;
+$('btnCalResetK')      .onclick = calResetK;
+$('btnCalResetVerify') .onclick = calResetVerify;
+renderCal();
 
 $('btnConnect')   .onclick = connect;
 $('btnDisconnect').onclick = disconnect;
