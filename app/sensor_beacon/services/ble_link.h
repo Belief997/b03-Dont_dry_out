@@ -59,10 +59,27 @@
  *     因为协议栈禁止在广播中修改广播参数(adv_set_configure 的
  *     NRF_ERROR_INVALID_STATE: "invalid to provide non-NULL advertising set
  *     parameters while advertising")。
- *     代价: 可连接窗口期内数据广播是【停的】, 做不到严格"全周期存在";
- *           连接建立后更是整段时间都没有数据广播(连接占用了唯一的 role slot,
- *           此时 sd_ble_gap_adv_start 会返回 NRF_ERROR_CONN_COUNT)。
- *           只能靠"窗口尽量短 + 网关容忍丢包"来弱化。
+ *     代价: 只有【可连接窗口那一段】没有数据广播(唯一的广播集被可连接包占用),
+ *           窗口结束或连上之后, 数据广播都可以恢复 —— 见下方"连接期间"一条。
+ *
+ *   ⚠ 连接期间【可以】继续播不可连接广播(此前本注释写反了, 已更正):
+ *     Peripheral(连接) 与 Broadcaster(不可连接广播) 是两个独立的 role,
+ *     连接占用的是 periph_role_count, 不占广播集。sd_ble_gap_adv_start 的
+ *     NRF_ERROR_CONN_COUNT 措辞限定在"connectable advertiser cannot be
+ *     started" —— 只挡可连接广播, 不挡不可连接广播。
+ *     实证(比文档更硬): SDK 自带 eddystone 就是干这件事的, 且随包提供了
+ *     pca10040e_s112 的预编译 hex, 说明 S112 上确实跑得通:
+ *       components/ble/ble_services/eddystone/es_adv.c 的 BLE_GAP_EVT_CONNECTED
+ *       分支直接调 es_adv_start_non_connctable_adv(), 原注释写着
+ *       "The beacon must provide these advertisements for the client to see
+ *        updated values during the connection."
+ *     而同文件 adv_start() 里 sd_ble_gap_adv_start 只容忍 NRF_ERROR_BUSY,
+ *     其余错误(含 CONN_COUNT / RESOURCES)一律 APP_ERROR_CHECK 断言 ——
+ *     若连接期间开不可连接广播真会返回 CONN_COUNT, 这个官方例程一连上就 fault。
+ *
+ *     故"连接期间数据广播必然断流"不成立。真正的代价只是: 连接期间广播集要在
+ *     "数据帧"与"无"之间被 stop/configure/start 反复重配, 每次重配后还得重设
+ *     sd_ble_gap_tx_power_set(TX 功率是跟着广播集的, 见 main.c:508 的既有做法)。
  *
  * 本模块为这两个方案都留好了钩子: ble_link_adv_stop() 让出广播集,
  * ble_link_disconnect() 主动挂断, ble_link_is_advertising() 供上层判断

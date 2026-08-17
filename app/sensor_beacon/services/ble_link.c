@@ -448,10 +448,14 @@ ret_code_t ble_link_adv_start(void)
         return NRF_SUCCESS;         /* 已在广播, 不重复启动 */
     }
 
-    /* 已连接时不能开可连接广播: S112 只有 1 个 peripheral 连接槽,
+    /* 已连接时不能开【可连接】广播: S112 只有 1 个 peripheral 连接槽,
      * 槽位被占满时 sd_ble_gap_adv_start() 会返回 NRF_ERROR_CONN_COUNT。
      * 这里提前返回成功并保留 m_adv_enabled —— 断开后由 DISCONNECTED
-     * 分支自动补上开播, 语义上"意图已登记", 不算失败。 */
+     * 分支自动补上开播, 语义上"意图已登记", 不算失败。
+     *
+     * ⚠ 该限制只针对可连接广播。连接期间开【不可连接】广播是允许的
+     *   (Broadcaster 与 Peripheral 是两个独立 role), 将来的传感器数据
+     *   广播模块不必受这里的早退约束 —— 详见 ble_link.h 头部说明。 */
     if (m_conn_handle != BLE_CONN_HANDLE_INVALID)
     {
         NRF_LOG_INFO("Connected; advertising will resume after disconnect.");
