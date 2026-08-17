@@ -55,6 +55,10 @@
 #include "nrf_log_default_backends.h"
 #include "nrf_delay.h"
 
+/* 板载外设驱动(独立源文件, 见 dev/app/sensor_beacon/drivers/) */
+#include "drv_led.h"
+#include "drv_key.h"
+
 /* ==================================================================
  *  可配置参数(TODO: 按实际硬件/需求修改)
  * ================================================================== */
@@ -823,6 +827,73 @@ static void hx711_timer_handler(void * p_context)
 }
 
 /* ==================================================================
+ *  示例: 按键控制 LED —— 三种手势各对应一种 LED 行为
+ * ==================================================================
+ *
+ * 事件映射:
+ *   单击 → toggle。在静态亮/灭之间翻转; 若此刻正在闪烁, 则退出闪烁并
+ *          定格为"当前瞬时电平的反相"(见 drv_led_toggle 说明)。
+ *   双击 → 快闪 (半周期 DRV_LED_BLINK_FAST_MS)
+ *   长按 → 慢闪 (半周期 DRV_LED_BLINK_SLOW_MS)
+ *
+ * 事件名由驱动统一打印(见 drv_key.c 的 evt_report), 这里再打印一次
+ * "动作后的结果", 便于在串口日志上把"事件"与"效果"对上。
+ *
+ * ⚠ 本回调在 app_timer 中断上下文执行(见 drv_key.h 说明), 因此只做
+ *   GPIO 翻转、定时器启停与日志入队, 不做阻塞操作。
+ *
+ * ⚠ 这里不用 APP_ERROR_CHECK 处理 drv_led_blink() 的返回值 —— 中断里
+ *   断言失败会直接进 fault handler。闪烁只是示例效果, 起不来打条警告即可。 */
+static void key_evt_handler_led_demo(drv_key_evt_t evt)
+{
+    ret_code_t err = NRF_SUCCESS;
+
+    switch (evt)
+    {
+        case DRV_KEY_EVT_SINGLE_CLICK:
+            drv_led_toggle();
+            NRF_LOG_INFO("KEY %s -> LED %s (static)",
+                         drv_key_evt_str(evt), drv_led_is_on() ? "ON" : "OFF");
+            break;
+
+        case DRV_KEY_EVT_DOUBLE_CLICK:
+            err = drv_led_blink(DRV_LED_BLINK_FAST);
+            NRF_LOG_INFO("KEY %s -> LED blink FAST (half-period %ums)",
+                         drv_key_evt_str(evt), DRV_LED_BLINK_FAST_MS);
+            break;
+
+        case DRV_KEY_EVT_LONG_PRESS:
+            err = drv_led_blink(DRV_LED_BLINK_SLOW);
+            NRF_LOG_INFO("KEY %s -> LED blink SLOW (half-period %ums)",
+                         drv_key_evt_str(evt), DRV_LED_BLINK_SLOW_MS);
+            break;
+
+        default:
+            break;
+    }
+
+    if (err != NRF_SUCCESS)
+    {
+        NRF_LOG_WARNING("LED blink request failed (0x%08x)", err);
+    }
+}
+
+/* 一次性装配该示例: LED + KEY 初始化并绑定上面的回调。
+ * 前置条件: app_timer_init() 已完成(两个驱动都依赖 app_timer)。 */
+static void example_key_led_init(void)
+{
+    ret_code_t err;
+
+    err = drv_led_init();
+    APP_ERROR_CHECK(err);
+
+    err = drv_key_init(key_evt_handler_led_demo);
+    APP_ERROR_CHECK(err);
+
+    NRF_LOG_INFO("Example ready: single=toggle, double=fast blink, long=slow blink.");
+}
+
+/* ==================================================================
  *  main
  * ================================================================== */
 
@@ -853,6 +924,10 @@ int main(void)
     ma_init(&m_ma_1b);
     ma_init(&m_ma_2a);
 
+    /* 3.6) 板载外设: LED + 按键(单击 toggle / 双击快闪 / 长按慢闪)。
+     *      必须在 timers_init() 之后 —— 两个驱动都要 app_timer_create。 */
+    example_key_led_init();
+
     /* 4) 创建周期定时器 —— 100ms 非阻塞采样:
      *    每 tick 仅"尝试读"(就绪才读, 未就绪跳过), 无忙等, 回调耗时微秒级。
      *    模块 10Hz 模式下: #2 单通道连读可达满速 10Hz; #1 因交替切换需在
@@ -866,6 +941,8 @@ int main(void)
     }
 
     NRF_LOG_INFO("HX711 test running: poll every 100ms...");
+    NRF_LOG_INFO("KEY/LED active: KEY=P0.%02u LED=P0.%02u", DRV_KEY_PIN, DRV_LED_PIN);
+    NRF_LOG_INFO("  single click -> toggle, double click -> fast blink, long press -> slow blink");
     NRF_LOG_FLUSH();
 
     /* 5) 主循环: 空闲 + 刷新日志（日志后端若配置为 UART 则从串口输出） */
