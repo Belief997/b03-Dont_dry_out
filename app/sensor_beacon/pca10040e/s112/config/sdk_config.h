@@ -72,12 +72,44 @@
 
 // <e> NRF_BLE_QWR_ENABLED - nrf_ble_qwr - Queued writes support module (prepare/execute write)
 //==========================================================
+// 由 ble_link(可连接 NUS 透传口) 引入: 处理超过单包的长写入。
 #ifndef NRF_BLE_QWR_ENABLED
-#define NRF_BLE_QWR_ENABLED 0
+#define NRF_BLE_QWR_ENABLED 1
 #endif
-// <o> NRF_BLE_QWR_MAX_ATTR - Maximum number of attribute handles that can be registered. This number must be adjusted according to the number of attributes for which Queued Writes will be enabled. If it is zero, the module will reject all Queued Write requests. 
+// <o> NRF_BLE_QWR_MAX_ATTR - Maximum number of attribute handles that can be registered. This number must be adjusted according to the number of attributes for which Queued Writes will be enabled. If it is zero, the module will reject all Queued Write requests.
+// 0 与 SDK 的 ble_app_uart 参考例程一致: NUS 不注册需排队写的属性,
+// QWR 仅用于接管 BLE_GATTS_EVT_RW_AUTHORIZE_REQUEST, 无需属性表空间。
 #ifndef NRF_BLE_QWR_MAX_ATTR
 #define NRF_BLE_QWR_MAX_ATTR 0
+#endif
+
+// </e>
+
+// <e> NRF_BLE_GATT_ENABLED - nrf_ble_gatt - GATT module
+//==========================================================
+// 由 ble_link 引入: 负责 ATT MTU 交换, 决定单包可传字节数。
+#ifndef NRF_BLE_GATT_ENABLED
+#define NRF_BLE_GATT_ENABLED 1
+#endif
+
+// </e>
+
+// <e> NRF_BLE_CONN_PARAMS_ENABLED - ble_conn_params - Initiating and executing a connection parameters negotiation procedure
+//==========================================================
+// 由 ble_link 引入: 连上后向主机协商连接间隔/超时。
+#ifndef NRF_BLE_CONN_PARAMS_ENABLED
+#define NRF_BLE_CONN_PARAMS_ENABLED 1
+#endif
+// <o> NRF_BLE_CONN_PARAMS_MAX_SLAVE_LATENCY_DEVIATION - The largest acceptable deviation in slave latency.
+// <i> The largest deviation (+ or -) from the requested slave latency that will not be renegotiated.
+#ifndef NRF_BLE_CONN_PARAMS_MAX_SLAVE_LATENCY_DEVIATION
+#define NRF_BLE_CONN_PARAMS_MAX_SLAVE_LATENCY_DEVIATION 499
+#endif
+
+// <o> NRF_BLE_CONN_PARAMS_MAX_SUPERVISION_TIMEOUT_DEVIATION - The largest acceptable deviation (in 10 ms units) in supervision timeout.
+// <i> The largest deviation (+ or -, in 10 ms units) from the requested supervision timeout that will not be renegotiated.
+#ifndef NRF_BLE_CONN_PARAMS_MAX_SUPERVISION_TIMEOUT_DEVIATION
+#define NRF_BLE_CONN_PARAMS_MAX_SUPERVISION_TIMEOUT_DEVIATION 65535
 #endif
 
 // </e>
@@ -365,8 +397,9 @@
 
 // <e> BLE_NUS_ENABLED - ble_nus - Nordic UART Service
 //==========================================================
+// 由 ble_link 引入: 作为 cmd 协议的字节流承载(RX 写入 / TX 通知)。
 #ifndef BLE_NUS_ENABLED
-#define BLE_NUS_ENABLED 0
+#define BLE_NUS_ENABLED 1
 #endif
 // <e> BLE_NUS_CONFIG_LOG_ENABLED - Enables logging in the module.
 //==========================================================
@@ -8803,14 +8836,20 @@
 
 
 // <i> Requested BLE GAP data length to be negotiated.
-
+// 27 → 251: 27 是"只发广播"时代的默认值(链路层单包最小载荷)。
+// 现在 MTU 已提到 247, 若链路层仍限 27 字节, 每个通知都要被拆成多个链路层
+// 分片发送, 吞吐白白打折。251 是链路层上限, 与参考例程 ble_app_uart 一致。
+// ⚠ 与 MTU 一样会占 SoftDevice 的 RAM, 已包含在下移后的 RAM 起始地址预算里。
 #ifndef NRF_SDH_BLE_GAP_DATA_LENGTH
-#define NRF_SDH_BLE_GAP_DATA_LENGTH 27
+#define NRF_SDH_BLE_GAP_DATA_LENGTH 251
 #endif
 
-// <o> NRF_SDH_BLE_PERIPHERAL_LINK_COUNT - Maximum number of peripheral links. 
+// <o> NRF_SDH_BLE_PERIPHERAL_LINK_COUNT - Maximum number of peripheral links.
+// 0 → 1: 原先是"纯 beacon, 只广播不接受连接"。ble_link 需要能被连上,
+// 必须为 1。ble_conn_params.c 也用它做实例数组尺寸, 为 0 会直接 #error。
+// ⚠ 改这个会推高 SoftDevice 的 RAM 占用 → 必须同步下移工程 RAM 起始地址。
 #ifndef NRF_SDH_BLE_PERIPHERAL_LINK_COUNT
-#define NRF_SDH_BLE_PERIPHERAL_LINK_COUNT 0
+#define NRF_SDH_BLE_PERIPHERAL_LINK_COUNT 1
 #endif
 
 // <o> NRF_SDH_BLE_CENTRAL_LINK_COUNT - Maximum number of central links. 
@@ -8832,19 +8871,28 @@
 #define NRF_SDH_BLE_GAP_EVENT_LENGTH 6
 #endif
 
-// <o> NRF_SDH_BLE_GATT_MAX_MTU_SIZE - Static maximum MTU size. 
+// <o> NRF_SDH_BLE_GATT_MAX_MTU_SIZE - Static maximum MTU size.
+// 23 → 247: 23 是 BLE 默认 MTU, 单包只能传 20 字节(减去 ATT 的 3 字节头)。
+// 247 与 SDK 的 ble_app_uart(S112/pca10040e) 参考例程一致, 单包可传 244 字节,
+// 给后续 cmd 协议留出足够的帧空间, 避免协议层自己做分片重组。
+// ⚠ 此值直接影响 SoftDevice 的 RAM 占用。
 #ifndef NRF_SDH_BLE_GATT_MAX_MTU_SIZE
-#define NRF_SDH_BLE_GATT_MAX_MTU_SIZE 23
+#define NRF_SDH_BLE_GATT_MAX_MTU_SIZE 247
 #endif
 
-// <o> NRF_SDH_BLE_GATTS_ATTR_TAB_SIZE - Attribute Table size in bytes. The size must be a multiple of 4. 
+// <o> NRF_SDH_BLE_GATTS_ATTR_TAB_SIZE - Attribute Table size in bytes. The size must be a multiple of 4.
+// 248 → 1408: 248 只够放 GAP/GATT 这两个强制服务。NUS 还要加一个 128bit
+// 服务 + 两个特性 + CCCD, 放不下会在 ble_nus_init() 里返回 NRF_ERROR_NO_MEM。
+// 1408 取自 SDK ble_app_uart 参考例程(已验证够用), 未自行压缩以免踩边界。
 #ifndef NRF_SDH_BLE_GATTS_ATTR_TAB_SIZE
-#define NRF_SDH_BLE_GATTS_ATTR_TAB_SIZE 248
+#define NRF_SDH_BLE_GATTS_ATTR_TAB_SIZE 1408
 #endif
 
-// <o> NRF_SDH_BLE_VS_UUID_COUNT - The number of vendor-specific UUIDs. 
+// <o> NRF_SDH_BLE_VS_UUID_COUNT - The number of vendor-specific UUIDs.
+// 0 → 1: NUS 用的是 128bit 厂商自定义 UUID, 需要一个 vs-UUID 槽位。
+// 为 0 时 ble_nus_init() 内的 sd_ble_uuid_vs_add() 会返回 NRF_ERROR_NO_MEM。
 #ifndef NRF_SDH_BLE_VS_UUID_COUNT
-#define NRF_SDH_BLE_VS_UUID_COUNT 0
+#define NRF_SDH_BLE_VS_UUID_COUNT 1
 #endif
 
 // <q> NRF_SDH_BLE_SERVICE_CHANGED  - Include the Service Changed characteristic in the Attribute Table.

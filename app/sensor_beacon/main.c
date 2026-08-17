@@ -58,6 +58,7 @@
 /* 板载外设驱动(独立源文件, 见 dev/app/sensor_beacon/drivers/) */
 #include "drv_led.h"
 #include "drv_key.h"
+#include "ble_link.h"
 
 /* ==================================================================
  *  可配置参数(TODO: 按实际硬件/需求修改)
@@ -894,6 +895,63 @@ static void example_key_led_init(void)
 }
 
 /* ==================================================================
+ *  BLE 透传链路: 收到数据的处理(后续 cmd 协议的接入点)
+ * ==================================================================
+ *
+ * 当前实现只做两件事: 打印 + 原样回显。
+ *   - 打印: 原始字节的 hexdump 已由 ble_link.c 统一打印(收/发各一次),
+ *           这里只补一条"可打印形式", 方便手机端直接发文本调试。
+ *   - 回显: 把收到的字节发回去。这既是"收发数据都能打印"的最简闭环验证,
+ *           也占住了后续 cmd 协议的回包位置 —— 协议接进来后, 这里换成
+ *           "解析 → 入队 → 主循环执行 → 回包"即可。
+ *
+ * ⚠ 本回调在 SoftDevice 事件中断上下文执行(见 ble_link.h 说明), 因此:
+ *     - 不可阻塞、不可长延时;
+ *     - 不用 APP_ERROR_CHECK —— 中断里断言失败直接进 fault handler;
+ *     - 回显失败(NRF_ERROR_RESOURCES: 发送缓冲满)只记日志, 不重试。
+ *       真正需要可靠回包时, 应改为入队 + BLE_NUS_EVT_TX_RDY 驱动续发。
+ */
+static void ble_link_rx_handler(const uint8_t * p_data, uint16_t len)
+{
+    /* 转成以 NUL 结尾的字符串再打印: NRF_LOG 的 %s 需要 NUL 结尾,
+     * 而 NUS 收到的是裸字节流, 不保证有终止符。
+     * 缓冲取 32 字节即可 —— 只为"看一眼", 超长部分靠 hexdump 看全。 */
+    char text[32];
+    uint16_t n = (len < (sizeof(text) - 1)) ? len : (uint16_t)(sizeof(text) - 1);
+
+    for (uint16_t i = 0; i < n; i++)
+    {
+        /* 非可打印字符替换成 '.', 免得控制字符把终端搞乱 */
+        text[i] = ((p_data[i] >= 0x20) && (p_data[i] < 0x7f)) ? (char)p_data[i] : '.';
+    }
+    text[n] = '\0';
+
+    NRF_LOG_INFO("APP got %u bytes: \"%s\"%s", len, NRF_LOG_PUSH(text),
+                 (n < len) ? " (truncated)" : "");
+
+    /* 回显 */
+    ret_code_t err = ble_link_send(p_data, len);
+    if (err != NRF_SUCCESS)
+    {
+        NRF_LOG_WARNING("echo failed (0x%08x)", err);
+    }
+}
+
+/* 一次性装配可连接广播 + 透传服务, 并立即开播。
+ * 前置条件: ble_stack_init() 与 timers_init() 均已完成
+ *           (ble_conn_params 内部要用 app_timer)。 */
+static void ble_link_start(void)
+{
+    ret_code_t err;
+
+    err = ble_link_init(ble_link_rx_handler);
+    APP_ERROR_CHECK(err);
+
+    err = ble_link_adv_start();
+    APP_ERROR_CHECK(err);
+}
+
+/* ==================================================================
  *  main
  * ================================================================== */
 
@@ -928,6 +986,13 @@ int main(void)
      *      必须在 timers_init() 之后 —— 两个驱动都要 app_timer_create。 */
     example_key_led_init();
 
+    /* 3.7) 可连接广播 + NUS 透传链路。开机即开播, 手机可直接搜到 "water"。
+     *      必须在 ble_stack_init()(协议栈) 与 timers_init()(app_timer) 之后。
+     *
+     *      ⚠ 与本文件的 advertising_init()/advertising_start() 那套 beacon
+     *        广播互斥: S112 只有一个广播集。当前分支不调用它们, 故无冲突。 */
+    ble_link_start();
+
     /* 4) 创建周期定时器 —— 100ms 非阻塞采样:
      *    每 tick 仅"尝试读"(就绪才读, 未就绪跳过), 无忙等, 回调耗时微秒级。
      *    模块 10Hz 模式下: #2 单通道连读可达满速 10Hz; #1 因交替切换需在
@@ -943,6 +1008,8 @@ int main(void)
     NRF_LOG_INFO("HX711 test running: poll every 100ms...");
     NRF_LOG_INFO("KEY/LED active: KEY=P0.%02u LED=P0.%02u", DRV_KEY_PIN, DRV_LED_PIN);
     NRF_LOG_INFO("  single click -> toggle, double click -> fast blink, long press -> slow blink");
+    NRF_LOG_INFO("BLE \"%s\" advertising, connectable; NUS echoes what it receives.",
+                 BLE_LINK_DEVICE_NAME);
     NRF_LOG_FLUSH();
 
     /* 5) 主循环: 空闲 + 刷新日志（日志后端若配置为 UART 则从串口输出） */
