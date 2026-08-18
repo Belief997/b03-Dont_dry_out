@@ -49,6 +49,7 @@
 
 #include "nrf_pwr_mgmt.h"
 #include "nrf_drv_saadc.h"
+#include "nrf_drv_gpiote.h"
 
 #include "nrf_log.h"
 #include "nrf_log_ctrl.h"
@@ -64,11 +65,26 @@
  *  可配置参数(TODO: 按实际硬件/需求修改)
  * ================================================================== */
 
-/* 唤醒引脚: 外部比较器输出接入的 GPIO。
- * TODO: 改为实际布线的引脚号。当前 13 = pca10040 DK 的 Button1,便于台架测试。 */
-#define WAKE_PIN                    13
+/* 唤醒引脚: 外部电平变化(比较器/干簧管/霍尔等)接入的 GPIO。
+ *
+ * 选 P0.22 的理由(详见下方 HX711 段的引脚约束表):
+ *   - 两板都引出且都空闲: DK 上是 Arduino 排针 D10(非 Button/LED/UART),
+ *     E73-TBM 上是 P2 排针第 27 脚(原理图 E73-TBM-01-SCH)。
+ *   - 不在数据手册 Table 100 的"低驱动低频 only"名单里(那份名单只含
+ *     P0.25~P0.29),故无射频邻近限制。
+ *   - QFN48 第 27 脚, 与 SWDCLK(25)/SWDIO(26) 相邻但功能独立, 不碍调试。
+ *   - 不占 AIN(P0.02~05 / P0.28~31), 给模拟输入留余量。
+ *
+ * ⚠ SENSE 一次只能武装一个方向(高或低), 硬件不支持"任意边沿"。双向唤醒的
+ *   做法见 rearm_and_off(): 读当前电平, 武装相反方向。 */
+#define WAKE_PIN                    22
 
-/* 唤醒引脚上拉/下拉: 使能内部上拉 */
+/* 唤醒引脚上拉/下拉: 使能内部上拉(RPU 典型 13kΩ, 数据手册 GPIO 电气规格)。
+ *
+ * 选上拉而非 NOPULL: 外部若是开漏/集电极开路输出(比较器常见), 必须有上拉
+ * 才能确定高电平; 且悬空输入在 System OFF 下会因电平漂移引起误唤醒。
+ * 代价是被拉低期间有 VDD/13k ≈ 250µA 漏流 —— 若外部确认为推挽输出,
+ * 可改 NRF_GPIO_PIN_NOPULL 省掉这笔。 */
 #define WAKE_PIN_PULL               NRF_GPIO_PIN_PULLUP
 
 /* 电池电压 ADC 通道: 内部 VDD 输入,无需外部引脚 */
@@ -118,6 +134,18 @@
  *   → 两板交集中安全可用: P0.11, P0.12, P0.22, P0.23, P0.24
  *
  * ⚠ P0.22/23/24 在 QFN48 上与 SWDIO/SWDCLK 相邻但功能独立,不影响调试。
+ *
+ * 当前分配情况(上面 5 个安全引脚已全部用掉):
+ *   P0.11/12 = HX711 #1, P0.23/24 = HX711 #2, P0.22 = WAKE_PIN
+ * 若日后还需引脚, 候选只剩下面这些, 各有代价:
+ *   - P0.15/16 : 真机空闲, 但 DK 上是 Button3/4(台架调试会冲突)
+ *   - P0.19/20 : 真机空闲, 但 DK 上是 LED3/4
+ *   - P0.30/31 : 两板都空闲且不在 Table 100 名单内, 但占用 AIN6/AIN7
+ *   - P0.25~29 : 仅限低速信号(慢速电平输入可以, 时钟/PWM 不行)
+ *   - P0.09/10 : 真机是 NFC 焊盘, 但 nRF52810 无 NFCT 外设(已核
+ *                nrf52810_peripherals.h 无 NFCT_PRESENT), 故可当普通 GPIO
+ *   - P0.00/01 : 若 LF 时钟改用内部 RC 则可释放。当前
+ *                NRF_SDH_CLOCK_LF_SRC = 1 (XTAL), 被 32.768kHz 晶振占用
  */
 
 /* --- HX711 #1 --- */
@@ -287,7 +315,6 @@ static ble_gap_adv_data_t       m_adv_data =
 static ble_gap_adv_params_t     m_adv_params;
 
 APP_TIMER_DEF(m_settling_timer);            /* 传感器稳定等待定时器(单次) */
-APP_TIMER_DEF(m_test_timer);                /* 测试: 500ms 周期采样定时器 */
 
 static volatile bool            m_settled  = false;   /* 稳定等待结束 */
 static volatile bool            m_adv_done = false;    /* 广播时长到,已终止 */
@@ -342,6 +369,97 @@ static void rearm_and_off(nrf_gpio_pin_sense_t sense)
     nrf_gpio_cfg_input(WAKE_PIN, WAKE_PIN_PULL);
     nrf_gpio_cfg_sense_set(WAKE_PIN, sense);
     system_off_direct();
+}
+
+/* ==================================================================
+ *  唤醒引脚 —— 运行态的边沿中断(联调用, 与 System OFF 的 SENSE 唤醒互补)
+ * ==================================================================
+ *
+ * 用途: 在【系统运行时】验证 WAKE_PIN 的外部布线与信号极性是否正确 ——
+ *       接上外部信号, 电平每变化一次就打一条日志。这样在把休眠逻辑真正
+ *       接进来之前, 先把"引脚选对了没、线接通了没、信号干净不干净"这些
+ *       硬件问题排掉。
+ *
+ * ⚠ 这【不是】深度休眠唤醒机制, 两者是不同的硬件路径:
+ *     - 本模块 = GPIOTE 边沿中断, 只在 System ON(运行/睡眠)下有效;
+ *     - 深度唤醒 = GPIO SENSE + DETECT, System OFF 下唯一可用的路径,
+ *       且唤醒等于芯片复位(见 rearm_and_off() / boot_read_and_classify())。
+ *   进 System OFF 前 GPIOTE 配置会失效, 必须另行 nrf_gpio_cfg_sense_set()。
+ *
+ * 为什么用 SENSE_TOGGLE 而不是 HITOLO/LOTOHI:
+ *   需求是"电平变化"即触发, 双向都要报。GPIOTE 的 TOGGLE 极性正好对应,
+ *   一个通道搞定; 若分开配上升/下降则要占两个通道。
+ *
+ * 关于 hi_accuracy(传给 GPIOTE_CONFIG_IN_SENSE_TOGGLE 的参数):
+ *   true  = IN_EVENT, 独占一个 GPIOTE 通道(共 8 个), 精度高但常开 HFCLK,
+ *           空闲功耗显著上升(数百 µA 级);
+ *   false = PORT_EVENT, 多引脚共享一个 PORT 事件, 低功耗。
+ *   本模块选 false —— 慢速电平变化不需要高精度时间戳, 且这颗芯片的定位
+ *   就是低功耗, 不能为了联调日志把静态功耗抬上去。
+ *   注意 PORT_EVENT 是所有引脚共享的, app_button(DRV_KEY_PIN) 也走这条,
+ *   nrf_drv_gpiote 内部会统一分发, 不冲突。
+ *
+ * ⚠ 上下文: 回调在 GPIOTE 中断里执行(优先级 GPIOTE_CONFIG_IRQ_PRIORITY = 7),
+ *   故只做计数与日志入队, 不做阻塞操作, 不用 APP_ERROR_CHECK。
+ */
+
+/* 累计触发次数。volatile: 中断里写, 主循环/日志读。 */
+static volatile uint32_t m_wake_edge_count = 0;
+
+static void wake_pin_evt_handler(nrf_drv_gpiote_pin_t pin, nrf_gpiote_polarity_t action)
+{
+    (void)action;   /* TOGGLE 模式下 action 恒为 TOGGLE, 无区分意义 */
+
+    if (pin != WAKE_PIN)
+    {
+        return;
+    }
+
+    m_wake_edge_count++;
+
+    /* 读回当前电平以区分是上升沿还是下降沿。
+     * ⚠ 这是"中断响应时"的电平, 不等于"触发瞬间"的电平 —— 若信号变化快于
+     *   中断延迟, 或存在抖动, 两者可能不一致。本模块只用于联调观察,
+     *   不做去抖; 若外部是机械触点(干簧管等), 一次动作可能打出多条日志,
+     *   那正是需要看到的现象。 */
+    uint32_t level = nrf_gpio_pin_read(WAKE_PIN);
+
+    NRF_LOG_INFO("WAKE_PIN edge #%u: P0.%02u now %s",
+                 m_wake_edge_count, WAKE_PIN, level ? "HIGH" : "LOW");
+}
+
+/* 配置 WAKE_PIN 为双向边沿中断并使能。
+ *
+ * 前置条件: 无(nrf_drv_gpiote_init 幂等, 内部有 is_init 判断)。
+ *           但若 app_button 已初始化过 GPIOTE, 这里的 init 会被跳过,
+ *           属正常路径 —— 故必须容忍 NRF_ERROR_INVALID_STATE。 */
+static void wake_pin_irq_init(void)
+{
+    ret_code_t err;
+
+    /* app_button 可能已经初始化过 GPIOTE。重复 init 返回 INVALID_STATE,
+     * 这不是错误, 忽略即可; 其余错误码才需要断言。 */
+    if (!nrf_drv_gpiote_is_init())
+    {
+        err = nrf_drv_gpiote_init();
+        APP_ERROR_CHECK(err);
+    }
+
+    /* hi_accuracy = false → 走低功耗的 PORT_EVENT, 见上方说明 */
+    nrf_drv_gpiote_in_config_t cfg = GPIOTE_CONFIG_IN_SENSE_TOGGLE(false);
+
+    /* 宏默认 pull = NOPULL, 这里覆盖为与深度唤醒路径一致的上拉配置,
+     * 保证两条路径看到的静态电平相同(开漏信号必须有上拉才能确定高电平)。 */
+    cfg.pull = WAKE_PIN_PULL;
+
+    err = nrf_drv_gpiote_in_init(WAKE_PIN, &cfg, wake_pin_evt_handler);
+    APP_ERROR_CHECK(err);
+
+    /* 第二参数 true = 使能中断(false 则只产生事件供 PPI 用, 不进 CPU) */
+    nrf_drv_gpiote_in_event_enable(WAKE_PIN, true);
+
+    NRF_LOG_INFO("WAKE_PIN irq armed: P0.%02u, both edges, pull-up, initial %s",
+                 WAKE_PIN, nrf_gpio_pin_read(WAKE_PIN) ? "HIGH" : "LOW");
 }
 
 /* ==================================================================
@@ -616,18 +734,6 @@ static void handle_event_active(void)
     err = sd_power_system_off();
     APP_ERROR_CHECK(err);
     for (;;) { __WFE(); }      /* 调试器连接时 System OFF 被仿真,循环等待 */
-}
-
-/* ==================================================================
- *  测试: 500ms 周期电池电压采样回调
- * ================================================================== */
-static void test_timer_handler(void * p_context)
-{
-    (void)p_context;
-
-    uint16_t batt_raw = saadc_sample_channel(SAADC_CH_BATTERY);
-
-    NRF_LOG_INFO("ADC: batt=%u raw (%u mV)", batt_raw, saadc_raw_to_mv(batt_raw));
 }
 
 /* ==================================================================
@@ -993,6 +1099,15 @@ int main(void)
      *        广播互斥: S112 只有一个广播集。当前分支不调用它们, 故无冲突。 */
     ble_link_start();
 
+    /* 3.8) 唤醒引脚边沿中断(联调): 外部电平每变化一次打一条日志。
+     *      必须在 example_key_led_init() 之后 —— 那里的 app_button 会初始化
+     *      GPIOTE, 本函数复用同一个驱动实例(内部有 is_init 判断, 顺序反了
+     *      也能工作, 但按依赖顺序写更清楚)。
+     *
+     *      ⚠ 这是 System ON 下的 GPIOTE 边沿中断, 不是深度休眠唤醒。
+     *        深度唤醒走 GPIO SENSE, 是另一条路径, 当前分支未启用。 */
+    wake_pin_irq_init();
+
     /* 4) 创建周期定时器 —— 100ms 非阻塞采样:
      *    每 tick 仅"尝试读"(就绪才读, 未就绪跳过), 无忙等, 回调耗时微秒级。
      *    模块 10Hz 模式下: #2 单通道连读可达满速 10Hz; #1 因交替切换需在
@@ -1010,6 +1125,8 @@ int main(void)
     NRF_LOG_INFO("  single click -> toggle, double click -> fast blink, long press -> slow blink");
     NRF_LOG_INFO("BLE \"%s\" advertising, connectable; NUS echoes what it receives.",
                  BLE_LINK_DEVICE_NAME);
+    NRF_LOG_INFO("WAKE_PIN P0.%02u: drive it high/low externally to see edge logs.",
+                 WAKE_PIN);
     NRF_LOG_FLUSH();
 
     /* 5) 主循环: 空闲 + 刷新日志（日志后端若配置为 UART 则从串口输出） */
@@ -1020,39 +1137,33 @@ int main(void)
 #endif
 
 
-#if 0
-    /* ===== ADC 测试: 每 500ms 采样并通过日志/串口打印 ===== */
-
-    /* 1) 使能 BLE 协议栈 (提供 LFCLK 给 app_timer) */
-    ble_stack_init();
-
-    /* 2) 初始化定时器 & 电源管理 */
-    timers_init();
-    power_management_init();
-
-    /* 3) 初始化 SAADC */
-    saadc_init();
-
-    /* 4) 创建 500ms 周期定时器并启动 */
-    {
-        ret_code_t err = app_timer_create(&m_test_timer, APP_TIMER_MODE_REPEATED,
-                                          test_timer_handler);
-        APP_ERROR_CHECK(err);
-        err = app_timer_start(m_test_timer, APP_TIMER_TICKS(500), NULL);
-        APP_ERROR_CHECK(err);
-    }
-
-    NRF_LOG_INFO("ADC test running: sample every 500ms...");
-    NRF_LOG_FLUSH();
-
-    /* 5) 主循环: 空闲 + 刷新日志（日志后端若配置为 UART 则从串口输出） */
-    for (;;)
-    {
-        nrf_pwr_mgmt_run();
-    }
-#endif
+    /* ==============================================================
+     *  原分支 2(ADC 500ms 轮询测试)已于 2026-08-18 按需求删除。
+     *  随之清理的独占符号: m_test_timer、test_timer_handler()。
+     *  saadc_init/uninit/sample_channel/callback/raw_to_mv 全部保留 ——
+     *  下面分支 3 的 handle_event_active() 仍在用, 不是死代码。
+     * ============================================================== */
 
 
+    /* ==============================================================
+     *  分支 3 —— 深度休眠/唤醒/广播主逻辑【逻辑参考, 不会直接启用】
+     * ==============================================================
+     *
+     * 这段是完整的"SENSE 唤醒 → 判定阶段 → 采集 → 广播 → 回 System OFF"
+     * 闭环。保留它是【作为实现参考】: 将来把休眠逻辑接进上面分支 1 时,
+     * 时序与状态判定照这里抄。它本身不会被切成 #if 1 单独启用 ——
+     * 直接启用会撞上两个已知问题:
+     *
+     *   1) handle_event_active() 调 advertising_init(), 用的是本文件的
+     *      m_adv_handle; 而 services/ble_link.c 另有自己的句柄。S112 只有
+     *      一个广播集(BLE_GAP_ADV_SET_COUNT_MAX == 1), 两条广播路径同时
+     *      激活必有一方拿到 NRF_ERROR_NO_MEM。要等广播仲裁做完才解得开。
+     *
+     *   2) 分支 1 里 wake_pin_irq_init() 装的 GPIOTE 边沿中断在 System OFF
+     *      下失效 —— 那是另一条硬件路径。进 System OFF 前必须改走
+     *      nrf_gpio_cfg_sense_set(), 即本分支 rearm_and_off() 的做法。
+     *      两者互补而不可互相替代, 详见 wake_pin_irq_init() 上方说明。
+     * ============================================================== */
 #if 0
 
 
