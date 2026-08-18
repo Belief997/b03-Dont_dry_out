@@ -27,6 +27,10 @@ extern "C" {
 #define DRV_LED_BLINK_SLOW_MS       500     /* 慢闪: 1Hz */
 #define DRV_LED_BLINK_FAST_MS       100     /* 快闪: 5Hz */
 
+/* 单次闪烁的默认亮灯时长(ms)。80ms 是"肉眼确实看得见"的下限附近 ——
+ * 再短会被视觉暂留吃掉, 再长在连续多次触发时会显得拖沓。 */
+#define DRV_LED_FLASH_ONCE_MS       80
+
 /**@brief 闪烁模式 */
 typedef enum
 {
@@ -70,6 +74,21 @@ bool drv_led_is_on(void);
  * @retval NRF_SUCCESS 成功, 否则为 app_timer_start 的错误码。
  */
 ret_code_t drv_led_blink(drv_led_blink_t mode);
+
+/**@brief 闪一下就灭: 点亮 on_ms 毫秒后自动熄灭, 期间不占用调用方。
+ *
+ * 与 drv_led_blink() 的区别是它只发生一次, 不需要调用方再来关。用于"事件
+ * 已受理"这类瞬时反馈。
+ *
+ * @param on_ms  亮灯时长(ms), 传 0 则用 DRV_LED_FLASH_ONCE_MS。
+ *
+ * @note 会先停止正在进行的闪烁 —— 单次反馈与持续闪烁语义冲突, 后者会被顶掉。
+ *       亮灯期间再次调用则重新计时(相当于延长这次闪烁), 不会排队。
+ *       可在中断上下文调用。
+ *
+ * @retval NRF_SUCCESS 成功, 否则为 app_timer_start 的错误码。
+ */
+ret_code_t drv_led_flash_once(uint32_t on_ms);
 
 /**@brief 查询当前闪烁模式。 */
 drv_led_blink_t drv_led_blink_get(void);

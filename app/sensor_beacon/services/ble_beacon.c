@@ -1,14 +1,13 @@
 /**
- * ble_beacon —— 不可连接数据广播实现
+ * ble_beacon —— 不可连接数据广播实现(按次触发)
  * ------------------------------------------------------------------
- * 缓冲布局(为什么是两块):
- *   m_enc[0] / m_enc[1] 交替使用。sd_ble_gap_adv_set_configure() 只记指针,
- *   SoftDevice 发包时直接读原地址, 所以"正在播的那块"不能被改写 ——
- *   要更新就得把新内容编码到另一块, 再把新指针交给协议栈。
- *   m_idx 指向【下一次要写入】的那块, 也就是当前没在用的那块。
+ * 只有一块编码缓冲(不再双缓冲): 每次触发都是 stop → configure → start 的
+ * 完整一轮, configure 发生在没有广播的时刻, 复用同一块缓冲是合法的。
+ * 双缓冲只有"广播中不停播地换数据"才需要, 而那个用法已随需求变更删除。
  *
- * 载荷副本 m_payload 的作用: 让 ble_beacon_update() 在"广播集不在自己手上"
- * 时也能收下新数据 —— 等下次 start() 时直接用, 上层不必自己缓存。
+ * 播够 BLE_BEACON_ADV_EVENTS 次后由协议栈自动停播并产生
+ * BLE_GAP_EVT_ADV_SET_TERMINATED(LIMIT_REACHED), ble_adv_mux 在优先级 1
+ * 收到该事件时会同步 m_advertising = false, 所以本模块不需要自己数次数。
  */
 
 #include "ble_beacon.h"
@@ -25,15 +24,15 @@ NRF_LOG_MODULE_REGISTER();
 
 static bool     m_inited = false;
 static uint8_t  m_payload[BLE_BEACON_PAYLOAD_LEN];
-
-/* 双缓冲: m_idx 是"下一次写哪块"。 */
-static uint8_t  m_enc[2][BLE_GAP_ADV_SET_DATA_SIZE_MAX];
-static uint8_t  m_idx = 0;
+static uint8_t  m_enc[BLE_GAP_ADV_SET_DATA_SIZE_MAX];
 
 static ble_gap_adv_params_t m_adv_params;
 
-/* 把 m_payload 编码进 m_enc[m_idx], 并翻转 m_idx。
- * 输出的 ble_gap_adv_data_t 指向刚写好的那块。 */
+/* 把 m_payload 编码进 m_enc, 输出的 ble_gap_adv_data_t 指向它。
+ *
+ * ⚠ m_enc 必须在整个广播期间保持有效 —— sd_ble_gap_adv_set_configure()
+ *   只记住指针, SoftDevice 每次发包时直接读这里, 不做内部拷贝。故它是
+ *   文件作用域的静态变量, 不能是栈上的。 */
 static ret_code_t payload_encode(ble_gap_adv_data_t * p_out)
 {
     ble_advdata_manuf_data_t manuf =
@@ -49,10 +48,9 @@ static ret_code_t payload_encode(ble_gap_adv_data_t * p_out)
     advdata.flags                 = BLE_GAP_ADV_FLAG_BR_EDR_NOT_SUPPORTED;
     advdata.p_manuf_specific_data = &manuf;
 
-    uint8_t  * p_buf = m_enc[m_idx];
-    uint16_t   len   = BLE_GAP_ADV_SET_DATA_SIZE_MAX;
+    uint16_t len = BLE_GAP_ADV_SET_DATA_SIZE_MAX;
 
-    ret_code_t err = ble_advdata_encode(&advdata, p_buf, &len);
+    ret_code_t err = ble_advdata_encode(&advdata, m_enc, &len);
     if (err != NRF_SUCCESS)
     {
         /* 最可能的原因是载荷太长: 31 - Flags(3) - 厂商段头(4) = 24 字节上限 */
@@ -61,14 +59,13 @@ static ret_code_t payload_encode(ble_gap_adv_data_t * p_out)
         return err;
     }
 
-    p_out->adv_data.p_data      = p_buf;
+    p_out->adv_data.p_data      = m_enc;
     p_out->adv_data.len         = len;
     /* 不可连接不可扫描 → 没有扫描响应包, 必须传 NULL/0。
      * 给不可扫描广播配扫描响应数据会被协议栈判为 INVALID_PARAM。 */
     p_out->scan_rsp_data.p_data = NULL;
     p_out->scan_rsp_data.len    = 0;
 
-    m_idx ^= 1;    /* 下次写另一块 */
     return NRF_SUCCESS;
 }
 
@@ -80,24 +77,29 @@ ret_code_t ble_beacon_init(void)
     }
 
     memset(m_payload, 0, sizeof(m_payload));
-    m_idx = 0;
 
     memset(&m_adv_params, 0, sizeof(m_adv_params));
     m_adv_params.properties.type = BLE_GAP_ADV_TYPE_NONCONNECTABLE_NONSCANNABLE_UNDIRECTED;
     m_adv_params.p_peer_addr     = NULL;            /* 非定向 */
     m_adv_params.filter_policy   = BLE_GAP_ADV_FP_ANY;
     m_adv_params.interval        = MSEC_TO_UNITS(BLE_BEACON_ADV_INTERVAL_MS, UNIT_0_625_MS);
-    m_adv_params.duration        = 0;               /* 不限时: 平时一直播 */
     m_adv_params.primary_phy     = BLE_GAP_PHY_1MBPS;
+
+    /* 播够 N 个广播事件就自动停 —— 这是"只播三次"的实现核心。
+     * duration 保持 0: 次数已经限定了时长(N × interval), 再加时间限制只会
+     * 引入"两个终止条件谁先到"的不确定性。 */
+    m_adv_params.max_adv_evts    = BLE_BEACON_ADV_EVENTS;
+    m_adv_params.duration        = 0;
 
     m_inited = true;
 
-    NRF_LOG_INFO("Beacon ready: non-connectable, interval %ums, payload %u bytes.",
-                 BLE_BEACON_ADV_INTERVAL_MS, BLE_BEACON_PAYLOAD_LEN);
+    NRF_LOG_INFO("Beacon ready: non-connectable, %u events/burst, interval %ums, payload %u bytes.",
+                 BLE_BEACON_ADV_EVENTS, BLE_BEACON_ADV_INTERVAL_MS,
+                 BLE_BEACON_PAYLOAD_LEN);
     return NRF_SUCCESS;
 }
 
-ret_code_t ble_beacon_start(const uint8_t * p_payload)
+ret_code_t ble_beacon_burst(const uint8_t * p_payload)
 {
     if (!m_inited)
     {
@@ -117,39 +119,16 @@ ret_code_t ble_beacon_start(const uint8_t * p_payload)
         return err;
     }
 
-    return ble_adv_mux_start(BLE_ADV_OWNER_BEACON, &data, &m_adv_params,
-                             BLE_BEACON_TX_POWER_DBM);
-}
-
-ret_code_t ble_beacon_update(const uint8_t * p_payload)
-{
-    if (!m_inited)
+    /* mux 内部会先 stop(若上一轮还没播完) 再 configure 再 start,
+     * 所以"上一轮被丢弃、从头数 N 次"是自然结果, 不需要额外处理。 */
+    err = ble_adv_mux_start(BLE_ADV_OWNER_BEACON, &data, &m_adv_params,
+                            BLE_BEACON_TX_POWER_DBM);
+    if (err == NRF_SUCCESS)
     {
-        return NRF_ERROR_INVALID_STATE;
+        NRF_LOG_INFO("Beacon burst: %u events of the same packet.",
+                     BLE_BEACON_ADV_EVENTS);
     }
-    if (p_payload == NULL)
-    {
-        return NRF_ERROR_NULL;
-    }
-
-    memcpy(m_payload, p_payload, BLE_BEACON_PAYLOAD_LEN);
-
-    /* 广播集不在自己手上(让给了 ble_link, 或正在连接中) → 只留副本。
-     * 返回 INVALID_STATE 让调用方知道"这次没播出去", 但数据不会丢。 */
-    if (!ble_beacon_is_advertising())
-    {
-        return NRF_ERROR_INVALID_STATE;
-    }
-
-    ble_gap_adv_data_t data;
-    ret_code_t err = payload_encode(&data);
-    if (err != NRF_SUCCESS)
-    {
-        return err;
-    }
-
-    /* 不中断广播地换数据 —— 靠的就是 payload_encode 每次给出不同缓冲。 */
-    return ble_adv_mux_update_data(BLE_ADV_OWNER_BEACON, &data);
+    return err;
 }
 
 ret_code_t ble_beacon_stop(void)

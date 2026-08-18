@@ -60,6 +60,8 @@
 #include "drv_led.h"
 #include "drv_key.h"
 #include "ble_link.h"
+#include "ble_adv_mux.h"
+#include "ble_beacon.h"
 
 /* ==================================================================
  *  可配置参数(TODO: 按实际硬件/需求修改)
@@ -93,10 +95,18 @@
 /* 传感器上电到数据稳定的等待时间(ms)。TODO: 按传感器手册确定 (1000~2000)。 */
 #define SETTLING_TIME_MS            1500
 
-/* 广播参数。TODO: 按上报可靠性/功耗折中确定。 */
-#define ADV_INTERVAL_MS             100     /* 广播间隔(ms) */
-#define ADV_DURATION_MS             2000    /* 广播总时长(ms),到时 SD 自动停止 */
-#define ADV_TX_POWER_DBM            0       /* 发射功率(dBm): -40..+4,S112 支持 */
+/* 单击一次要播几个广播事件 —— 现由协议栈的 max_adv_evts 保证, 见
+ * BLE_BEACON_ADV_EVENTS。这里不再有 SAMPLE_BURST_COUNT / GAP 那套应用层节拍:
+ *
+ * 需求是"3 次的包为重复一样的包", 而 max_adv_evts 天然就是"同一份数据重播 N
+ * 次"(数据在 configure 时定下, 之后不变), 比应用层起定时器数三拍更准 ——
+ * 后者只能保证"播了大约 3×300ms", 播出去几个包取决于广播间隔与协议栈调度。
+ *
+ * 与之一并删除的是"平时常驻数据广播": 现在平时【不播】, 只在单击后播 3 次。 */
+
+/* 深度休眠路径(参考分支 3)每次唤醒后的数据广播窗口(ms)。
+ * 只被 handle_event_active() 使用 —— 那条路径要等广播播完再回 System OFF。 */
+#define ADV_WINDOW_MS               2000
 
 /* 厂商自定义数据 —— 公司标识。0xFFFF 为 SIG 保留(测试用)。
  * TODO: 若有 SIG 分配的 Company ID 请替换。 */
@@ -115,7 +125,9 @@
 #define DEVICE_ID_LEN               2
 
 #define APP_BLE_CONN_CFG_TAG        1       /* SoftDevice 连接配置标签 */
-#define APP_BLE_OBSERVER_PRIO       3       /* BLE 事件观察者优先级 */
+
+/* 本文件不再注册 NRF_SDH_BLE_OBSERVER, 故原 APP_BLE_OBSERVER_PRIO 已删。
+ * 各模块的观察者优先级: ble_adv_mux=1, ble_link=3(见各自源文件)。 */
 
 /* 计数器存放的 GPREGRET 编号(0 = GPREGRET,1 = GPREGRET2) */
 #define GPREGRET_ID_COUNTER         0
@@ -299,25 +311,23 @@ static bool ma_ready(const ma_filter_t * f)
                                      - AD_TYPE_MANUF_SPEC_DATA_ID_SIZE)
 STATIC_ASSERT(MANUF_DATA_LEN <= MANUF_DATA_LEN_MAX);
 
+/* 载荷的封装(公司标识 + 段结构)由 ble_beacon 负责, 本文件只填字节。
+ * 两边的常量必须一致, 否则网关按 APP_COMPANY_IDENTIFIER 过滤会漏掉本设备。 */
+STATIC_ASSERT(APP_COMPANY_IDENTIFIER == BLE_BEACON_COMPANY_ID);
+
 /* ==================================================================
  *  全局状态
  * ================================================================== */
 
-static uint8_t                  m_adv_handle = BLE_GAP_ADV_SET_HANDLE_NOT_SET;
-static uint8_t                  m_enc_advdata[BLE_GAP_ADV_SET_DATA_SIZE_MAX];
 static uint8_t                  m_manuf_data[MANUF_DATA_LEN];
 
-static ble_gap_adv_data_t       m_adv_data =
-{
-    .adv_data      = { .p_data = m_enc_advdata, .len = BLE_GAP_ADV_SET_DATA_SIZE_MAX },
-    .scan_rsp_data = { .p_data = NULL,          .len = 0 }
-};
-static ble_gap_adv_params_t     m_adv_params;
+/* 载荷长度必须与 ble_beacon 的约定一致 —— 那个模块按固定长度拷贝载荷,
+ * 两边不一致会读越界或少播字节, 且是静默的。故编译期钉死。 */
+STATIC_ASSERT(MANUF_DATA_LEN == BLE_BEACON_PAYLOAD_LEN);
 
 APP_TIMER_DEF(m_settling_timer);            /* 传感器稳定等待定时器(单次) */
 
 static volatile bool            m_settled  = false;   /* 稳定等待结束 */
-static volatile bool            m_adv_done = false;    /* 广播时长到,已终止 */
 
 static uint8_t                  m_counter  = 0;        /* 8bit 事件计数器 */
 
@@ -486,12 +496,23 @@ static void saadc_init(void)
     APP_ERROR_CHECK(err);
 }
 
-/* 采集一路通道(阻塞)。负值(共模噪声)钳到 0。 */
+/* 采集一路通道(阻塞)。负值(共模噪声)钳到 0。
+ *
+ * ⚠ 不用 APP_ERROR_CHECK: 本函数会在 app_timer 中断上下文被调用
+ *   (单击连播时的 payload_refresh), 中断里断言失败直接进 fault handler。
+ *   失败只可能是 NRFX_ERROR_BUSY(SAADC 已在转换) —— 本工程只有这一处
+ *   在用 SAADC, 正常不会发生; 真发生了返回 0 比死机好。
+ *
+ * 阻塞时长: 12bit + 默认采集时间 10µs, 单次转换约十几微秒, 中断里可接受。 */
 static uint16_t saadc_sample_channel(uint8_t channel)
 {
     nrf_saadc_value_t v = 0;
     ret_code_t err = nrf_drv_saadc_sample_convert(channel, &v);
-    APP_ERROR_CHECK(err);
+    if (err != NRF_SUCCESS)
+    {
+        NRF_LOG_WARNING("saadc convert failed (0x%08x)", err);
+        return 0;
+    }
     return (v < 0) ? 0 : (uint16_t)v;
 }
 
@@ -554,25 +575,17 @@ static void payload_build(uint16_t batt_raw, const int32_t * p_sensors)
 }
 
 /* ==================================================================
- *  BLE 协议栈 / 广播
- * ================================================================== */
-
-static void ble_evt_handler(ble_evt_t const * p_ble_evt, void * p_context)
-{
-    switch (p_ble_evt->header.evt_id)
-    {
-        case BLE_GAP_EVT_ADV_SET_TERMINATED:
-            /* 广播时长到 → 结束本次活动 */
-            m_adv_done = true;
-            break;
-
-        default:
-            break;
-    }
-}
-
-/* BLE 事件观察者(必须在文件作用域注册:它是链接段内的静态变量) */
-NRF_SDH_BLE_OBSERVER(m_ble_observer, APP_BLE_OBSERVER_PRIO, ble_evt_handler, NULL);
+ *  BLE 协议栈
+ * ==================================================================
+ *
+ * 本文件【不再】注册自己的 NRF_SDH_BLE_OBSERVER, 也不再持有广播句柄:
+ *   - 广播集(S112 只有一个)由 services/ble_adv_mux.c 独占, 它在优先级 1
+ *     监听 CONNECTED / ADV_SET_TERMINATED 以同步"是否在播";
+ *   - 连接与可连接广播的生命周期由 services/ble_link.c 监听(优先级 3),
+ *     经 ble_link_evt_handler() 上报到本文件的策略层。
+ * 原先本文件那个只为 m_adv_done 服务的 observer 已随之删除 ——
+ * 数据广播现在是 duration=0 的常驻广播, 不存在"广播时长到了"这回事。
+ */
 
 static void ble_stack_init(void)
 {
@@ -589,48 +602,116 @@ static void ble_stack_init(void)
     APP_ERROR_CHECK(err);   /* 若报 NRF_ERROR_NO_MEM,按提示调整 .ld 中 RAM ORIGIN */
 }
 
-static void advertising_init(uint16_t batt_raw, const int32_t * p_sensors)
+/* 本文件的连接配置标签必须与 mux 实际用于 sd_ble_gap_adv_start() 的一致,
+ * 否则可连接广播会带着一份没被 nrf_sdh_ble_default_cfg_set() 配置过的
+ * conn_cfg 开播。两边都是 1, 编译期钉死以防日后单边改动。 */
+STATIC_ASSERT(APP_BLE_CONN_CFG_TAG == BLE_ADV_MUX_CONN_CFG_TAG);
+
+/* ==================================================================
+ *  广播策略层 —— "什么时候该播什么"集中在这里
+ * ==================================================================
+ *
+ * 广播集只有一个(见 ble_link.h 头部的长篇论证), 所以"数据广播"与"可连接
+ * 广播"是分时的。谁该占用它不是任何一个模块自己能决定的事, 必须由应用层
+ * 编排 —— 这就是本节存在的理由。ble_link.c / ble_beacon.c 都只上报事件、
+ * 提供动作, 不做策略。
+ *
+ * 状态迁移(与需求逐条对应):
+ *   开机            → 【什么都不播】, LED 灭
+ *   单击            → LED 闪一下 + 同一份数据播 BLE_BEACON_ADV_EVENTS 次,
+ *                     播完协议栈自动停 → 回到"什么都不播"
+ *   长按            → LED 快闪 + 可连接广播开(30s 窗口)
+ *   连上            → LED 常亮
+ *   断开 / 窗口到期 → LED 灭 + 可连接广播关 → 回到"什么都不播"
+ *
+ * ⚠ 平时不播任何广播(需求: "平时数据广播不能持续广播")。所以设备在没被按过
+ *   按键、也没连接的时候是完全静默的 —— 网关只在有人按键时能收到数据。
+ *   这也意味着"设备是否活着"无法从空气中判断, 若日后需要心跳, 应该是
+ *   起一个长周期定时器调 adv_policy_burst_data(), 而不是把 beacon 改回常驻。
+ *
+ * ⚠ 连接期间为什么不播数据: 需求明确写的是"打开可连接蓝牙, 暂停数据广播",
+ *   且连接期间数据另有通路(NUS)。硬件其实【允许】同时播(Broadcaster 与
+ *   Peripheral 是独立 role, 详见 ble_link.h), 真要如此在
+ *   BLE_LINK_EVT_CONNECTED 分支加一次 adv_policy_burst_data() 即可。
+ */
+
+/* 取当前三通道滑动平均 + 重采一次电量, 组装进 m_manuf_data。 */
+static void payload_refresh(void)
 {
-    ret_code_t err;
-
-    payload_build(batt_raw, p_sensors);
-
-    ble_advdata_manuf_data_t manuf =
+    int32_t sensors[SENSOR_CH_COUNT] =
     {
-        .company_identifier = APP_COMPANY_IDENTIFIER,
-        .data.p_data        = m_manuf_data,
-        .data.size          = MANUF_DATA_LEN
+        ma_avg(&m_ma_1a),   /* ch0: HX711 #1 Channel A */
+        ma_avg(&m_ma_1b),   /* ch1: HX711 #1 Channel B */
+        ma_avg(&m_ma_2a)    /* ch2: HX711 #2 Channel A */
     };
 
-    ble_advdata_t advdata;
-    memset(&advdata, 0, sizeof(advdata));
-    advdata.name_type             = BLE_ADVDATA_NO_NAME;
-    advdata.flags                 = BLE_GAP_ADV_FLAG_BR_EDR_NOT_SUPPORTED;
-    advdata.p_manuf_specific_data = &manuf;
-
-    err = ble_advdata_encode(&advdata, m_adv_data.adv_data.p_data,
-                             &m_adv_data.adv_data.len);
-    APP_ERROR_CHECK(err);
-
-    memset(&m_adv_params, 0, sizeof(m_adv_params));
-    m_adv_params.properties.type = BLE_GAP_ADV_TYPE_NONCONNECTABLE_NONSCANNABLE_UNDIRECTED;
-    m_adv_params.p_peer_addr     = NULL;
-    m_adv_params.filter_policy   = BLE_GAP_ADV_FP_ANY;
-    m_adv_params.interval        = MSEC_TO_UNITS(ADV_INTERVAL_MS, UNIT_0_625_MS);
-    m_adv_params.duration        = ADV_DURATION_MS / 10;   /* 单位 10ms,0=不限时 */
-
-    err = sd_ble_gap_adv_set_configure(&m_adv_handle, &m_adv_data, &m_adv_params);
-    APP_ERROR_CHECK(err);
-
-    /* 设置发射功率(需在 adv_set_configure 之后,针对该 adv handle) */
-    err = sd_ble_gap_tx_power_set(BLE_GAP_TX_POWER_ROLE_ADV, m_adv_handle, ADV_TX_POWER_DBM);
-    APP_ERROR_CHECK(err);
+    payload_build(saadc_sample_channel(SAADC_CH_BATTERY), sensors);
 }
 
-static void advertising_start(void)
+/* 采一份新数据并播 BLE_BEACON_ADV_EVENTS 次(同一份数据重复播)。
+ * 播完由协议栈自动停 —— 本函数不需要善后, 也没有配套的 stop。
+ *
+ * ⚠ 可在中断上下文调用 —— 故只记日志, 不 APP_ERROR_CHECK。 */
+static void adv_policy_burst_data(void)
 {
-    ret_code_t err = sd_ble_gap_adv_start(m_adv_handle, APP_BLE_CONN_CFG_TAG);
-    APP_ERROR_CHECK(err);
+    /* 可连接窗口/连接期间广播集不在数据广播手上 —— 此时开播会把可连接广播
+     * 抢掉, 等于用户刚长按打开的调试口被一次单击关掉了。宁可不发。 */
+    if (ble_link_is_advertising() || ble_link_is_connected())
+    {
+        NRF_LOG_INFO("Connectable window active; data burst skipped.");
+        return;
+    }
+
+    m_counter = (uint8_t)(m_counter + 1);
+    payload_refresh();
+
+    ret_code_t err = ble_beacon_burst(m_manuf_data);
+    if (err != NRF_SUCCESS)
+    {
+        NRF_LOG_WARNING("beacon burst failed (0x%08x)", err);
+        return;
+    }
+
+    NRF_LOG_INFO("Data burst started (counter=%u, %u identical packets).",
+                 m_counter, BLE_BEACON_ADV_EVENTS);
+}
+
+/* 打开可连接广播(抢占广播集; 若数据广播正播到一半, 那半轮被丢弃)。 */
+static void adv_policy_open_connectable(void)
+{
+    ret_code_t err = drv_led_blink(DRV_LED_BLINK_FAST);
+    if (err != NRF_SUCCESS)
+    {
+        NRF_LOG_WARNING("LED fast blink failed (0x%08x)", err);
+    }
+
+    err = ble_link_adv_start();
+    if (err != NRF_SUCCESS)
+    {
+        NRF_LOG_WARNING("connectable adv failed (0x%08x)", err);
+        /* 开不起来就别留着快闪骗人 —— 灯灭, 回到"什么都不播"的静默态。 */
+        drv_led_off();
+        return;
+    }
+
+    NRF_LOG_INFO("Connectable window open (%us).", BLE_LINK_ADV_DURATION_MS / 1000);
+}
+
+/* 关闭可连接广播并回到"平时"状态: 灯灭 + 什么都不播。
+ * 连接断开与窗口到期两条路径都收敛到这里。
+ *
+ * ⚠ 这里【不】补一次数据广播: 平时静默是需求。要数据就再单击一次。 */
+static void adv_policy_idle(void)
+{
+    drv_led_off();
+
+    ret_code_t err = ble_link_adv_stop();
+    if (err != NRF_SUCCESS)
+    {
+        NRF_LOG_WARNING("connectable adv stop failed (0x%08x)", err);
+    }
+
+    NRF_LOG_INFO("Idle: no advertising until next key press.");
 }
 
 /* ==================================================================
@@ -705,10 +786,15 @@ static void handle_event_active(void)
     saadc_uninit();
     NRF_LOG_INFO("batt_mv=%u", saadc_raw_to_mv(batt_raw));
 
-    /* 5) 组装并发送非连接广播,等待时长到(SD 产生 ADV_SET_TERMINATED)
+    /* 5) 组装并发送非连接广播, 播 BLE_BEACON_ADV_EVENTS 次后由协议栈自动停。
      *    传感器值取滑动平均(比单帧原始值更稳);当前唤醒路径尚未接入 HX711
      *    采集,窗口为空时 ma_avg() 返回 0,即三通道字段为占位 0。
-     *    TODO: 接入 HX711 采集后,此处应在稳定等待期内完成取样再广播。 */
+     *    TODO: 接入 HX711 采集后,此处应在稳定等待期内完成取样再广播。
+     *
+     *    ⚠ 这里仍用定时器等 ADV_WINDOW_MS 而非等 ADV_SET_TERMINATED 事件:
+     *      本函数是顺序执行的裸流程(idle_until 阻塞式等标志), 接事件回调要多
+     *      一个静态标志, 而"数够时间"在这条路径上足够 —— ADV_WINDOW_MS(2000ms)
+     *      远大于 3 次广播实际耗时(3 × 100ms)。 */
     int32_t sensors[SENSOR_CH_COUNT] =
     {
         ma_avg(&m_ma_1a),   /* ch0: HX711 #1 Channel A */
@@ -716,17 +802,24 @@ static void handle_event_active(void)
         ma_avg(&m_ma_2a)    /* ch2: HX711 #2 Channel A */
     };
 
-    m_adv_done = false;
-    advertising_init(batt_raw, sensors);
-    advertising_start();
-    idle_until(&m_adv_done);
+    payload_build(batt_raw, sensors);
+
+    err = ble_beacon_init();
+    APP_ERROR_CHECK(err);
+    err = ble_beacon_burst(m_manuf_data);
+    APP_ERROR_CHECK(err);
+
+    m_settled = false;      /* 复用同一个单次定时器计广播窗口 */
+    err = app_timer_start(m_settling_timer, APP_TIMER_TICKS(ADV_WINDOW_MS), NULL);
+    APP_ERROR_CHECK(err);
+    idle_until(&m_settled);
 
     /* 6) 广播结束 → 武装 SENSE=LOW(等待信号回落的低电平唤醒) → System OFF。
      *    此处 SD 已使能,须用 sd_power_* 而非直接寄存器。 */
     NRF_LOG_INFO("Adv done. Arm SENSE_LOW, System OFF.");
     NRF_LOG_FLUSH();
 
-    (void)sd_ble_gap_adv_stop(m_adv_handle);   /* 安全起见显式停止 */
+    (void)ble_beacon_stop();
 
     nrf_gpio_cfg_input(WAKE_PIN, WAKE_PIN_PULL);
     nrf_gpio_cfg_sense_set(WAKE_PIN, NRF_GPIO_PIN_SENSE_LOW);
@@ -934,70 +1027,80 @@ static void hx711_timer_handler(void * p_context)
 }
 
 /* ==================================================================
- *  示例: 按键控制 LED —— 三种手势各对应一种 LED 行为
+ *  按键手势 → 广播/LED 行为
  * ==================================================================
  *
- * 事件映射:
- *   单击 → toggle。在静态亮/灭之间翻转; 若此刻正在闪烁, 则退出闪烁并
- *          定格为"当前瞬时电平的反相"(见 drv_led_toggle 说明)。
- *   双击 → 快闪 (半周期 DRV_LED_BLINK_FAST_MS)
- *   长按 → 慢闪 (半周期 DRV_LED_BLINK_SLOW_MS)
+ * 事件映射(需求原文的逐条落地):
+ *   单击 → LED 闪一下 + 同一份采样数据播 BLE_BEACON_ADV_EVENTS 次
+ *          (数据 = 3 通道滑动窗口平均 + 电量, 见 payload_build)
+ *   长按 → LED 快闪 + 打开可连接广播(30s 窗口)
+ *   双击 → 主动关掉可连接窗口(需求未规定; 选这个是因为长按开的窗口总得有个
+ *          提前收工的办法, 否则只能干等超时)
  *
- * 事件名由驱动统一打印(见 drv_key.c 的 evt_report), 这里再打印一次
- * "动作后的结果", 便于在串口日志上把"事件"与"效果"对上。
+ * 事件名由驱动统一打印(见 drv_key.c 的 evt_report), 这里再打印"动作后的
+ * 结果", 便于在串口日志上把"事件"与"效果"对上。
  *
- * ⚠ 本回调在 app_timer 中断上下文执行(见 drv_key.h 说明), 因此只做
- *   GPIO 翻转、定时器启停与日志入队, 不做阻塞操作。
- *
- * ⚠ 这里不用 APP_ERROR_CHECK 处理 drv_led_blink() 的返回值 —— 中断里
- *   断言失败会直接进 fault handler。闪烁只是示例效果, 起不来打条警告即可。 */
-static void key_evt_handler_led_demo(drv_key_evt_t evt)
-{
-    ret_code_t err = NRF_SUCCESS;
+ * ⚠ 本回调在 app_timer 中断上下文执行(见 drv_key.h 说明), 因此只做 GPIO
+ *   翻转、定时器启停、SoftDevice 调用与日志入队, 不做阻塞操作, 且一律
+ *   不用 APP_ERROR_CHECK —— 中断里断言失败会直接进 fault handler。
+ */
 
+static void key_evt_handler(drv_key_evt_t evt)
+{
     switch (evt)
     {
         case DRV_KEY_EVT_SINGLE_CLICK:
-            drv_led_toggle();
-            NRF_LOG_INFO("KEY %s -> LED %s (static)",
-                         drv_key_evt_str(evt), drv_led_is_on() ? "ON" : "OFF");
+        {
+            ret_code_t err = drv_led_flash_once(0);
+            if (err != NRF_SUCCESS)
+            {
+                NRF_LOG_WARNING("LED flash failed (0x%08x)", err);
+            }
+
+            NRF_LOG_INFO("KEY %s -> flash + %u identical data packets",
+                         drv_key_evt_str(evt), BLE_BEACON_ADV_EVENTS);
+            adv_policy_burst_data();
+        } break;
+
+        case DRV_KEY_EVT_LONG_PRESS:
+            NRF_LOG_INFO("KEY %s -> open connectable window", drv_key_evt_str(evt));
+            adv_policy_open_connectable();
             break;
 
         case DRV_KEY_EVT_DOUBLE_CLICK:
-            err = drv_led_blink(DRV_LED_BLINK_FAST);
-            NRF_LOG_INFO("KEY %s -> LED blink FAST (half-period %ums)",
-                         drv_key_evt_str(evt), DRV_LED_BLINK_FAST_MS);
-            break;
-
-        case DRV_KEY_EVT_LONG_PRESS:
-            err = drv_led_blink(DRV_LED_BLINK_SLOW);
-            NRF_LOG_INFO("KEY %s -> LED blink SLOW (half-period %ums)",
-                         drv_key_evt_str(evt), DRV_LED_BLINK_SLOW_MS);
+            /* 提前收工: 连着的先挂断(断开事件里会收敛到 adv_policy_idle),
+             * 没连上的直接关窗口。 */
+            if (ble_link_is_connected())
+            {
+                NRF_LOG_INFO("KEY %s -> disconnect", drv_key_evt_str(evt));
+                (void)ble_link_disconnect();
+            }
+            else
+            {
+                NRF_LOG_INFO("KEY %s -> close connectable window",
+                             drv_key_evt_str(evt));
+                adv_policy_idle();
+            }
             break;
 
         default:
             break;
     }
-
-    if (err != NRF_SUCCESS)
-    {
-        NRF_LOG_WARNING("LED blink request failed (0x%08x)", err);
-    }
 }
 
-/* 一次性装配该示例: LED + KEY 初始化并绑定上面的回调。
+/* 一次性装配 LED + KEY。
  * 前置条件: app_timer_init() 已完成(两个驱动都依赖 app_timer)。 */
-static void example_key_led_init(void)
+static void key_led_init(void)
 {
     ret_code_t err;
 
     err = drv_led_init();
     APP_ERROR_CHECK(err);
 
-    err = drv_key_init(key_evt_handler_led_demo);
+    err = drv_key_init(key_evt_handler);
     APP_ERROR_CHECK(err);
 
-    NRF_LOG_INFO("Example ready: single=toggle, double=fast blink, long=slow blink.");
+    NRF_LOG_INFO("KEY/LED ready: single=burst, long=connectable, double=close.");
 }
 
 /* ==================================================================
@@ -1043,17 +1146,57 @@ static void ble_link_rx_handler(const uint8_t * p_data, uint16_t len)
     }
 }
 
-/* 一次性装配可连接广播 + 透传服务, 并立即开播。
+/* 链路状态事件 → LED 与广播策略。
+ *
+ * ⚠ 本回调在 SoftDevice 事件中断上下文执行(见 ble_link.h 说明), 同样
+ *   不可阻塞、不可 APP_ERROR_CHECK。 */
+static void ble_link_evt_handler(ble_link_evt_t evt)
+{
+    NRF_LOG_INFO("LINK %s", ble_link_evt_str(evt));
+
+    switch (evt)
+    {
+        case BLE_LINK_EVT_CONNECTED:
+            /* 常亮 = 已连上。不播数据广播(需求, 见广播策略层说明)。 */
+            drv_led_on();
+            break;
+
+        case BLE_LINK_EVT_DISCONNECTED:
+            /* 断开 → 灯灭 + 关闭可连接广播 → 回到静默。 */
+            adv_policy_idle();
+            break;
+
+        case BLE_LINK_EVT_ADV_TIMEOUT:
+            /* 窗口到期无人连接 → 与断开同样处理 */
+            NRF_LOG_INFO("Connectable window expired.");
+            adv_policy_idle();
+            break;
+
+        default:
+            break;
+    }
+}
+
+/* 一次性装配 BLE: 透传服务 + 数据广播模块。
+ *
+ * ⚠ 开机【什么广播都不开】(需求):
+ *     - 不开可连接广播 —— 要连就长按按键开 30s 窗口;
+ *     - 也不开数据广播 —— 数据只在单击后播 BLE_BEACON_ADV_EVENTS 次。
+ *   所以本函数只做初始化, 开机后设备在空中是完全静默的。
+ *
  * 前置条件: ble_stack_init() 与 timers_init() 均已完成
  *           (ble_conn_params 内部要用 app_timer)。 */
-static void ble_link_start(void)
+static void ble_start(void)
 {
     ret_code_t err;
 
-    err = ble_link_init(ble_link_rx_handler);
+    /* 可连接广播 + NUS: 只做配置, 不开播 */
+    err = ble_link_init(ble_link_rx_handler, ble_link_evt_handler);
     APP_ERROR_CHECK(err);
 
-    err = ble_link_adv_start();
+    /* 数据广播: 同样只做配置。首帧载荷等到第一次单击时才组装 ——
+     * 那时 HX711 滑动窗口已经有真实数据了。 */
+    err = ble_beacon_init();
     APP_ERROR_CHECK(err);
 }
 
@@ -1088,19 +1231,23 @@ int main(void)
     ma_init(&m_ma_1b);
     ma_init(&m_ma_2a);
 
-    /* 3.6) 板载外设: LED + 按键(单击 toggle / 双击快闪 / 长按慢闪)。
+    /* 3.6) 板载外设: LED + 按键。
      *      必须在 timers_init() 之后 —— 两个驱动都要 app_timer_create。 */
-    example_key_led_init();
+    key_led_init();
 
-    /* 3.7) 可连接广播 + NUS 透传链路。开机即开播, 手机可直接搜到 "water"。
-     *      必须在 ble_stack_init()(协议栈) 与 timers_init()(app_timer) 之后。
-     *
-     *      ⚠ 与本文件的 advertising_init()/advertising_start() 那套 beacon
-     *        广播互斥: S112 只有一个广播集。当前分支不调用它们, 故无冲突。 */
-    ble_link_start();
+    /* 3.65) SAADC: 电量采集。常驻初始化而不反复 init/uninit ——
+     *       单击时要在中断上下文里采一次电量, 那里不适合做外设的
+     *       初始化/反初始化。静态电流代价可忽略(SAADC 空闲不耗电,
+     *       只有转换那十几微秒才拉电流)。 */
+    saadc_init();
+
+    /* 3.7) BLE: NUS 透传服务 + 数据广播模块, 两者都只初始化不开播。
+     *      ⚠ 开机什么广播都不开(需求): 长按才开可连接窗口, 单击才播数据。
+     *      必须在 ble_stack_init()(协议栈) 与 timers_init()(app_timer) 之后。 */
+    ble_start();
 
     /* 3.8) 唤醒引脚边沿中断(联调): 外部电平每变化一次打一条日志。
-     *      必须在 example_key_led_init() 之后 —— 那里的 app_button 会初始化
+     *      必须在 key_led_init() 之后 —— 那里的 app_button 会初始化
      *      GPIOTE, 本函数复用同一个驱动实例(内部有 is_init 判断, 顺序反了
      *      也能工作, 但按依赖顺序写更清楚)。
      *
@@ -1122,9 +1269,12 @@ int main(void)
 
     NRF_LOG_INFO("HX711 test running: poll every 100ms...");
     NRF_LOG_INFO("KEY/LED active: KEY=P0.%02u LED=P0.%02u", DRV_KEY_PIN, DRV_LED_PIN);
-    NRF_LOG_INFO("  single click -> toggle, double click -> fast blink, long press -> slow blink");
-    NRF_LOG_INFO("BLE \"%s\" advertising, connectable; NUS echoes what it receives.",
-                 BLE_LINK_DEVICE_NAME);
+    NRF_LOG_INFO("  single -> flash + %u identical data packets",
+                 BLE_BEACON_ADV_EVENTS);
+    NRF_LOG_INFO("  long   -> connectable \"%s\" for %us",
+                 BLE_LINK_DEVICE_NAME, BLE_LINK_ADV_DURATION_MS / 1000);
+    NRF_LOG_INFO("  double -> close connectable window / disconnect");
+    NRF_LOG_INFO("BLE: silent until a key press (no periodic advertising).");
     NRF_LOG_INFO("WAKE_PIN P0.%02u: drive it high/low externally to see edge logs.",
                  WAKE_PIN);
     NRF_LOG_FLUSH();
@@ -1152,17 +1302,17 @@ int main(void)
      * 这段是完整的"SENSE 唤醒 → 判定阶段 → 采集 → 广播 → 回 System OFF"
      * 闭环。保留它是【作为实现参考】: 将来把休眠逻辑接进上面分支 1 时,
      * 时序与状态判定照这里抄。它本身不会被切成 #if 1 单独启用 ——
-     * 直接启用会撞上两个已知问题:
+     * 直接启用会撞上一个已知问题:
      *
-     *   1) handle_event_active() 调 advertising_init(), 用的是本文件的
-     *      m_adv_handle; 而 services/ble_link.c 另有自己的句柄。S112 只有
-     *      一个广播集(BLE_GAP_ADV_SET_COUNT_MAX == 1), 两条广播路径同时
-     *      激活必有一方拿到 NRF_ERROR_NO_MEM。要等广播仲裁做完才解得开。
+     *   分支 1 里 wake_pin_irq_init() 装的 GPIOTE 边沿中断在 System OFF
+     *   下失效 —— 那是另一条硬件路径。进 System OFF 前必须改走
+     *   nrf_gpio_cfg_sense_set(), 即本分支 rearm_and_off() 的做法。
+     *   两者互补而不可互相替代, 详见 wake_pin_irq_init() 上方说明。
      *
-     *   2) 分支 1 里 wake_pin_irq_init() 装的 GPIOTE 边沿中断在 System OFF
-     *      下失效 —— 那是另一条硬件路径。进 System OFF 前必须改走
-     *      nrf_gpio_cfg_sense_set(), 即本分支 rearm_and_off() 的做法。
-     *      两者互补而不可互相替代, 详见 wake_pin_irq_init() 上方说明。
+     * (原先还有第二个障碍: 本文件与 ble_link.c 各持一个广播句柄, 而 S112
+     *  只有一个广播集, 两条广播路径同时激活必有一方拿到 NRF_ERROR_NO_MEM。
+     *  该问题已随 ble_adv_mux 的引入解决 —— 广播集现由 mux 独占, 本分支
+     *  也改用 ble_beacon_burst()/stop(), 不再自己碰句柄。)
      * ============================================================== */
 #if 0
 

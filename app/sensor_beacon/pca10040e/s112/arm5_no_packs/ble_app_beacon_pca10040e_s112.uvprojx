@@ -414,6 +414,16 @@
               <FilePath>..\..\..\services\ble_link.c</FilePath>
             </File>
             <File>
+              <FileName>ble_adv_mux.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\..\..\services\ble_adv_mux.c</FilePath>
+            </File>
+            <File>
+              <FileName>ble_beacon.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\..\..\services\ble_beacon.c</FilePath>
+            </File>
+            <File>
               <FileName>main.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\..\..\main.c</FilePath>
@@ -2906,6 +2916,16 @@
               <FileName>ble_link.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\..\..\services\ble_link.c</FilePath>
+            </File>
+            <File>
+              <FileName>ble_adv_mux.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\..\..\services\ble_adv_mux.c</FilePath>
+            </File>
+            <File>
+              <FileName>ble_beacon.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\..\..\services\ble_beacon.c</FilePath>
             </File>
             <File>
               <FileName>main.c</FileName>

@@ -34,13 +34,11 @@
 #include "nrf_ble_qwr.h"
 #include "nrf_sdh_ble.h"
 
+#include "ble_adv_mux.h"
+
 #define NRF_LOG_MODULE_NAME ble_link
 #include "nrf_log.h"
 NRF_LOG_MODULE_REGISTER();
-
-/* SoftDevice 连接配置标签。必须与 main.c 里 nrf_sdh_ble_default_cfg_set()
- * 使用的标签一致 —— sd_ble_gap_adv_start() 靠它找到对应的连接配置。 */
-#define BLE_LINK_CONN_CFG_TAG       1
 
 /* 本模块自己的 BLE 事件观察者优先级。
  * 3 与 main.c 的 APP_BLE_OBSERVER_PRIO 相同: 同优先级的观察者都会被调用,
@@ -62,23 +60,24 @@ NRF_BLE_QWR_DEF(m_qwr);                             /* 长写入排队 */
 
 /* ---------- 模块状态 ---------- */
 
-static bool                     m_inited     = false;
+static bool                     m_inited      = false;
 static uint16_t                 m_conn_handle = BLE_CONN_HANDLE_INVALID;
-static uint8_t                  m_adv_handle  = BLE_GAP_ADV_SET_HANDLE_NOT_SET;
-static bool                     m_advertising = false;
 static ble_link_rx_handler_t    m_rx_handler  = NULL;
+static ble_link_evt_handler_t   m_evt_handler = NULL;
 
-/* "希望保持可连接" 的意图标志, 与 m_advertising(实际是否在播) 分开记。
+/* 注意这里【没有】m_adv_handle: 广播句柄由 ble_adv_mux 独占(S112 只有一个
+ * 广播集), 本模块只提交"内容 + 参数"。也没有 m_advertising ——
+ * "我是否在播"直接问 mux(见 ble_link_is_advertising), 避免两处状态打架。
  *
- * 为什么需要两个状态: 广播会因为"被连上"而由 SoftDevice 自动停止, 此时
- * m_advertising 变 false, 但我们的意图仍然是"这个口应该开着" —— 断开后
- * 要自动重播。而 ble_link_adv_stop() 表达的是相反的意图: 从此别再播了,
- * 断开后也不要自己起来。用一个 bool 区分不了这两种 false。 */
-static bool                     m_adv_enabled = false;
+ * 也没有"希望保持可连接"的意图标志了: 断开后是否恢复什么广播, 由上层按
+ * BLE_LINK_EVT_DISCONNECTED 决定。本模块不再自动重开播 —— 广播集是共享的,
+ * 自作主张重开会把上层刚恢复的数据广播抢掉。 */
 
 /* 编码后的广播数据缓冲。
  * ⚠ 这两块内存必须在整个广播期间保持有效 —— sd_ble_gap_adv_set_configure()
- *   只记住指针, SoftDevice 每次发包时直接读这里, 不做内部拷贝。 */
+ *   只记住指针, SoftDevice 每次发包时直接读这里, 不做内部拷贝。
+ *   本模块的广播内容(设备名 + NUS UUID)是恒定的, 故只编码一次、常驻使用;
+ *   不需要像 ble_beacon 那样双缓冲(那是"广播中更新数据"才有的要求)。 */
 static uint8_t                  m_enc_advdata[BLE_GAP_ADV_SET_DATA_SIZE_MAX];
 static uint8_t                  m_enc_scanrsp[BLE_GAP_ADV_SET_DATA_SIZE_MAX];
 
@@ -146,6 +145,30 @@ static void nus_data_handler(ble_nus_evt_t * p_evt)
  *  BLE 事件处理
  * ================================================================== */
 
+const char * ble_link_evt_str(ble_link_evt_t evt)
+{
+    switch (evt)
+    {
+        case BLE_LINK_EVT_CONNECTED:    return "CONNECTED";
+        case BLE_LINK_EVT_DISCONNECTED: return "DISCONNECTED";
+        case BLE_LINK_EVT_ADV_TIMEOUT:  return "ADV_TIMEOUT";
+        default:                        return "?";
+    }
+}
+
+/* 上报状态事件。回调可能为 NULL(上层不关心), 那就只留日志。 */
+static void evt_report(ble_link_evt_t evt)
+{
+    if (m_evt_handler != NULL)
+    {
+        m_evt_handler(evt);
+    }
+    else
+    {
+        NRF_LOG_INFO("link evt %s (no handler registered)", ble_link_evt_str(evt));
+    }
+}
+
 static void ble_evt_handler(ble_evt_t const * p_ble_evt, void * p_context)
 {
     (void)p_context;
@@ -156,7 +179,6 @@ static void ble_evt_handler(ble_evt_t const * p_ble_evt, void * p_context)
     {
         case BLE_GAP_EVT_CONNECTED:
             m_conn_handle = p_ble_evt->evt.gap_evt.conn_handle;
-            m_advertising = false;      /* 连上后 SoftDevice 自动停播 */
 
             NRF_LOG_INFO("Connected (handle 0x%04x).", m_conn_handle);
 
@@ -166,6 +188,10 @@ static void ble_evt_handler(ble_evt_t const * p_ble_evt, void * p_context)
             {
                 NRF_LOG_WARNING("qwr_conn_handle_assign failed (0x%08x)", err);
             }
+
+            /* 广播已由协议栈自动停止(ble_adv_mux 在优先级 1 已同步过状态),
+             * 但广播集仍记在本模块名下 —— 上层若要开数据广播会正常抢过去。 */
+            evt_report(BLE_LINK_EVT_CONNECTED);
             break;
 
         case BLE_GAP_EVT_DISCONNECTED:
@@ -173,34 +199,31 @@ static void ble_evt_handler(ble_evt_t const * p_ble_evt, void * p_context)
                          p_ble_evt->evt.gap_evt.params.disconnected.reason);
             m_conn_handle = BLE_CONN_HANDLE_INVALID;
 
-            /* 仅在"意图仍是开着"时自动重开播。调用过 ble_link_adv_stop()
-             * 之后 m_adv_enabled 为 false, 断开就真的安静下来 ——
-             * 否则"关闭广播"这个接口会被这里的自动重播悄悄推翻。
-             *
-             * ⚠ 在中断上下文里不能用 APP_ERROR_CHECK —— 断言失败会进 fault。 */
-            if (m_adv_enabled)
-            {
-                err = ble_link_adv_start();
-                if (err != NRF_SUCCESS)
-                {
-                    NRF_LOG_WARNING("adv restart failed (0x%08x)", err);
-                }
-            }
-            else
-            {
-                NRF_LOG_INFO("Advertising stays off (disabled by adv_stop).");
-            }
+            /* 【不】自动重开可连接广播 —— 广播集是与 ble_beacon 共享的,
+             * 自作主张重开会把上层想恢复的数据广播抢掉。断开之后该播什么
+             * 是应用层策略, 只上报, 由 main.c 决定。 */
+            evt_report(BLE_LINK_EVT_DISCONNECTED);
             break;
 
         case BLE_GAP_EVT_ADV_SET_TERMINATED:
-            /* 限时广播到期(BLE_LINK_ADV_DURATION_MS != 0 时才会发生)。
-             * 同时清掉意图标志 —— 到期是"广播生命周期自然结束", 不该让
-             * 后续某次断开连接把它又拉起来。需要继续播请显式 adv_start()。 */
-            m_advertising = false;
-            m_adv_enabled = false;
-            NRF_LOG_INFO("Advertising terminated (reason 0x%02x).",
-                         p_ble_evt->evt.gap_evt.params.adv_set_terminated.reason);
-            break;
+        {
+            uint8_t reason = p_ble_evt->evt.gap_evt.params.adv_set_terminated.reason;
+
+            NRF_LOG_INFO("Advertising terminated (reason 0x%02x).", reason);
+
+            /* ⚠ 这个事件对【任何】广播集持有者都会来一次, 包括 ble_beacon
+             *   的限时广播。只有"刚终止的广播确实是我的"才该上报 ——
+             *   靠 mux 的归属信息判断(它不在 CONNECTED/TERMINATED 时清 owner,
+             *   正是为了这个用途)。
+             *
+             *   而 TIMEOUT 之外的 reason(如 LIMIT_REACHED)不属于"窗口到期",
+             *   本模块的 duration 是唯一会触发 TIMEOUT 的配置, 故只认它。 */
+            if ((reason == BLE_GAP_EVT_ADV_SET_TERMINATED_REASON_TIMEOUT) &&
+                (ble_adv_mux_owner() == BLE_ADV_OWNER_LINK))
+            {
+                evt_report(BLE_LINK_EVT_ADV_TIMEOUT);
+            }
+        } break;
 
         case BLE_GAP_EVT_PHY_UPDATE_REQUEST:
         {
@@ -389,24 +412,32 @@ static ret_code_t advertising_config(void)
     m_adv_params.interval        = MSEC_TO_UNITS(BLE_LINK_ADV_INTERVAL_MS, UNIT_0_625_MS);
     m_adv_params.duration        = BLE_LINK_ADV_DURATION_MS / 10;   /* 单位 10ms, 0=不限时 */
 
-    return sd_ble_gap_adv_set_configure(&m_adv_handle, &m_adv_data, &m_adv_params);
+    /* 到此只是"把内容和参数备好"。真正的 sd_ble_gap_adv_set_configure()
+     * 由 ble_adv_mux_start() 在抢到广播集时调用 —— 广播集只有一个, 谁在播
+     * 就得由谁最后 configure, 本模块在 init 阶段抢跑只会把 beacon 的配置顶掉
+     * (或反之被顶掉), 状态无从对账。 */
+    return NRF_SUCCESS;
 }
 
 /* ==================================================================
  *  公共接口
  * ================================================================== */
 
-ret_code_t ble_link_init(ble_link_rx_handler_t rx_handler)
+ret_code_t ble_link_init(ble_link_rx_handler_t  rx_handler,
+                         ble_link_evt_handler_t evt_handler)
 {
     ret_code_t err;
 
     if (m_inited)
     {
-        m_rx_handler = rx_handler;   /* 允许重复调用时只更新回调 */
+        /* 允许重复调用时只更新回调 */
+        m_rx_handler  = rx_handler;
+        m_evt_handler = evt_handler;
         return NRF_SUCCESS;
     }
 
     m_rx_handler  = rx_handler;
+    m_evt_handler = evt_handler;
     m_conn_handle = BLE_CONN_HANDLE_INVALID;
 
     err = gap_params_init();
@@ -426,10 +457,11 @@ ret_code_t ble_link_init(ble_link_rx_handler_t rx_handler)
 
     m_inited = true;
 
-    NRF_LOG_INFO("BLE link ready: name=\"%s\", connectable, NUS transparent.",
+    NRF_LOG_INFO("BLE link ready: name=\"%s\", NUS transparent (not advertising yet).",
                  BLE_LINK_DEVICE_NAME);
-    NRF_LOG_INFO("  adv interval %ums, max payload %u bytes",
-                 BLE_LINK_ADV_INTERVAL_MS, ble_link_max_data_len());
+    NRF_LOG_INFO("  adv interval %ums, window %us, max payload %u bytes",
+                 BLE_LINK_ADV_INTERVAL_MS, BLE_LINK_ADV_DURATION_MS / 1000,
+                 ble_link_max_data_len());
     return NRF_SUCCESS;
 }
 
@@ -440,36 +472,31 @@ ret_code_t ble_link_adv_start(void)
         return NRF_ERROR_INVALID_STATE;
     }
 
-    /* 记下意图: 此后断开连接会自动重开播 */
-    m_adv_enabled = true;
-
-    if (m_advertising)
-    {
-        return NRF_SUCCESS;         /* 已在广播, 不重复启动 */
-    }
-
     /* 已连接时不能开【可连接】广播: S112 只有 1 个 peripheral 连接槽,
      * 槽位被占满时 sd_ble_gap_adv_start() 会返回 NRF_ERROR_CONN_COUNT。
-     * 这里提前返回成功并保留 m_adv_enabled —— 断开后由 DISCONNECTED
-     * 分支自动补上开播, 语义上"意图已登记", 不算失败。
+     * 提前返回成功: 调用方想要的"能被连上"这件事已经成立(它就连着),
+     * 不该让它去区分这种无意义的失败。
      *
      * ⚠ 该限制只针对可连接广播。连接期间开【不可连接】广播是允许的
-     *   (Broadcaster 与 Peripheral 是两个独立 role), 将来的传感器数据
-     *   广播模块不必受这里的早退约束 —— 详见 ble_link.h 头部说明。 */
+     *   (Broadcaster 与 Peripheral 是两个独立 role), ble_beacon 不受此约束
+     *   —— 详见 ble_link.h 头部说明。 */
     if (m_conn_handle != BLE_CONN_HANDLE_INVALID)
     {
-        NRF_LOG_INFO("Connected; advertising will resume after disconnect.");
+        NRF_LOG_INFO("Already connected; connectable advertising is moot.");
         return NRF_SUCCESS;
     }
 
-    ret_code_t err = sd_ble_gap_adv_start(m_adv_handle, BLE_LINK_CONN_CFG_TAG);
+    /* 抢占式: mux 内部会先停掉当前持有者(可能是数据广播), 再 configure
+     * 并重设 TX 功率, 最后 start。本模块不碰广播句柄。 */
+    ret_code_t err = ble_adv_mux_start(BLE_ADV_OWNER_LINK, &m_adv_data,
+                                       &m_adv_params, BLE_LINK_TX_POWER_DBM);
     if (err != NRF_SUCCESS)
     {
         return err;
     }
 
-    m_advertising = true;
-    NRF_LOG_INFO("Advertising as \"%s\".", BLE_LINK_DEVICE_NAME);
+    NRF_LOG_INFO("Advertising as \"%s\" (connectable, %us window).",
+                 BLE_LINK_DEVICE_NAME, BLE_LINK_ADV_DURATION_MS / 1000);
     return NRF_SUCCESS;
 }
 
@@ -480,27 +507,15 @@ ret_code_t ble_link_adv_stop(void)
         return NRF_ERROR_INVALID_STATE;
     }
 
-    /* 先清意图, 再停播 —— 顺序重要: 若反过来, sd_ble_gap_adv_stop() 之后
-     * 到清标志之前若插入 DISCONNECTED 事件(中断优先级高于本函数), 会被
-     * 自动重开播逻辑立刻推翻。 */
-    m_adv_enabled = false;
-
-    if (!m_advertising)
-    {
-        return NRF_SUCCESS;         /* 本来就没在播 */
-    }
-
-    ret_code_t err = sd_ble_gap_adv_stop(m_adv_handle);
-
-    /* INVALID_STATE = 协议栈认为本就没在播(例如刚被连上而事件还没处理完)。
-     * 我们的目标状态已达成, 按成功处理, 不让调用方去区分这种竞态。 */
-    if ((err != NRF_SUCCESS) && (err != NRF_ERROR_INVALID_STATE))
+    /* 礼让式: 若广播集当前不在本模块名下(例如已被数据广播抢走), mux 直接
+     * 返回成功 —— 我们的目标状态"不再播可连接包"本就已达成。 */
+    ret_code_t err = ble_adv_mux_stop(BLE_ADV_OWNER_LINK);
+    if (err != NRF_SUCCESS)
     {
         return err;
     }
 
-    m_advertising = false;
-    NRF_LOG_INFO("Advertising stopped (no longer connectable).");
+    NRF_LOG_INFO("Connectable advertising stopped (adv set released).");
     return NRF_SUCCESS;
 }
 
@@ -524,7 +539,9 @@ ret_code_t ble_link_disconnect(void)
 
 bool ble_link_is_advertising(void)
 {
-    return m_advertising;
+    /* 不自己记状态: 广播集是共享的, 本模块的"在播"当且仅当
+     * 广播集归我 且 确实在播。 */
+    return (ble_adv_mux_owner() == BLE_ADV_OWNER_LINK) && ble_adv_mux_is_advertising();
 }
 
 bool ble_link_is_connected(void)

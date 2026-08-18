@@ -12,14 +12,21 @@
  *   选它是因为手机端工具链现成(nRF Connect / Web Bluetooth 都直接支持),
  *   省掉自定义 GATT 表的对接成本; 协议层完全由我们自己在字节流上定义。
  *
- * ⚠ 与 main.c 里那套 beacon 广播互斥, 不能同时开:
+ * ⚠ 广播集不归本模块所有 —— 由 ble_adv_mux 独占持有:
  *   S112 的 BLE_GAP_ADV_SET_COUNT_MAX == 1, 整个协议栈只有一个广播集。
- *   main.c 的 advertising_init()/advertising_start() 是"事件触发不可连接
- *   广播"路径, 当前运行分支并未调用它, 故无冲突。
+ *   本模块与 ble_beacon(不可连接数据广播) 都通过 ble_adv_mux 申请, 只提交
+ *   "内容 + 参数", 不碰句柄。ble_link_adv_start() 是抢占式的, 会停掉数据广播;
+ *   ble_link_adv_stop() 则把广播集交还。谁在什么时候播由 main.c 编排。
  *
  * ==================================================================
  *  关于"不可连接的传感器数据广播 + 可连接调试广播 并存"(重要)
  * ==================================================================
+ *
+ * ⚠ 当前工程【不需要】两者并存 —— 需求已明确为分时且都是按需触发:
+ *   平时什么都不播; 单击时数据广播播 3 次(BLE_BEACON_ADV_EVENTS)就自动停;
+ *   长按时可连接广播占用广播集 30 秒。三种状态互不重叠, 广播集永远只有
+ *   至多一个使用者。下面的论证保留下来, 是为了记录"想并存也做不到"这个
+ *   硬约束, 免得日后有人再花时间去试。
  *
  * 结论: 在 S112 上【无法】让两种广播真正同时存在。硬约束有两条, 都来自
  *       协议栈本身, 不是配置能放开的:
@@ -83,8 +90,9 @@
  *
  * 本模块为这两个方案都留好了钩子: ble_link_adv_stop() 让出广播集,
  * ble_link_disconnect() 主动挂断, ble_link_is_advertising() 供上层判断
- * 当前归属。真正的切换编排(谁在什么时候占用广播集)应放在上层一个
- * "广播仲裁"模块里, 而不是塞进本模块 —— 本模块只管好自己那一半。
+ * 当前归属。当前工程走的是方案 B 的一个变体 —— 数据广播不是"平时一直播",
+ * 而是"单击时播 3 次", 所以三种状态(静默 / 数据 3 连播 / 可连接窗口)天然
+ * 互斥, 切换编排在 main.c(见那里的 adv_policy_*)。
  *
  * ⚠ 依赖(必须已完成初始化, 顺序敏感):
  *     ble_stack_init()  → SoftDevice 已使能
@@ -120,10 +128,23 @@ extern "C" {
 /* 广播间隔(ms)。可连接广播, 40ms 是"搜得快"与"功耗可接受"的常用折中。 */
 #define BLE_LINK_ADV_INTERVAL_MS    40
 
-/* 广播时长: 0 = 不限时, 一直播到被连上。
- * 断开后默认自动重新开播(见 ble_link.c 的 DISCONNECTED 分支); 但若调用过
- * ble_link_adv_stop(), 则断开后保持静默, 直到再次显式 ble_link_adv_start()。 */
-#define BLE_LINK_ADV_DURATION_MS    0
+/* 发射功率(dBm), S112 支持 -40..+4 的若干档位。TX 功率是跟着广播集的,
+ * 每次重配后都要重设 —— 这件事由 ble_adv_mux 统一代劳, 这里只给值。 */
+#define BLE_LINK_TX_POWER_DBM       0
+
+/* 可连接广播时长(ms)。0 = 不限时, 一直播到被连上。
+ *
+ * 取 30000(30s): 让协议栈自己在到期时产生
+ * BLE_GAP_EVT_ADV_SET_TERMINATED(reason = TIMEOUT), 比自起 app_timer 省资源。
+ * 窗口不宜过长: 期间设备是可被连接的, 且 40ms 间隔的可连接广播比数据广播费电。
+ *
+ * ⚠ 单位换算: 本宏是毫秒, 而 ble_gap_adv_params_t::duration 的单位是 10ms,
+ *   转换在 advertising_config() 里做(/10)。上限
+ *   BLE_GAP_ADV_TIMEOUT_LIMITED_MAX = 18000(10ms 单位) = 180 秒, 超过会让
+ *   sd_ble_gap_adv_set_configure() 返回 NRF_ERROR_INVALID_PARAM。
+ *
+ * 到期后本模块上报 BLE_LINK_EVT_ADV_TIMEOUT, 由 main.c 关灯收尾。 */
+#define BLE_LINK_ADV_DURATION_MS    30000
 
 /* 期望的连接参数。连上后由 ble_conn_params 模块向主机协商。 */
 #define BLE_LINK_MIN_CONN_INTERVAL_MS   20
@@ -143,30 +164,59 @@ extern "C" {
  */
 typedef void (*ble_link_rx_handler_t)(const uint8_t * p_data, uint16_t len);
 
-/**@brief 初始化 GAP / GATT / NUS / 连接参数协商, 并配置好广播内容。
+/**@brief 链路状态事件。
+ *
+ * 存在的理由: 广播集是共享资源(见文件头), "连上/断开/窗口到期之后该谁播"
+ * 是应用层策略, 本模块不该自作主张。所以这些时刻只上报, 由 main.c 决定
+ * 恢复数据广播、关灯等动作。
+ */
+typedef enum
+{
+    BLE_LINK_EVT_CONNECTED = 0,     /**< 已建立连接(广播已由协议栈自动停止) */
+    BLE_LINK_EVT_DISCONNECTED,      /**< 连接已断开。本模块【不会】自动重开播 */
+    BLE_LINK_EVT_ADV_TIMEOUT        /**< 限时可连接广播到期而无人连上 */
+} ble_link_evt_t;
+
+/**@brief 链路状态事件回调。
+ *
+ * @note ⚠ 与 rx_handler 同样在 SoftDevice 事件中断上下文中执行。回调内只做
+ *       轻量操作(设标志、启停定时器、切广播), 不可阻塞, 不可 APP_ERROR_CHECK
+ *       —— 中断里断言失败会直接进 fault handler。
+ */
+typedef void (*ble_link_evt_handler_t)(ble_link_evt_t evt);
+
+/**@brief 事件名字符串(用于日志打印)。 */
+const char * ble_link_evt_str(ble_link_evt_t evt);
+
+/**@brief 初始化 GAP / GATT / NUS / 连接参数协商, 并准备好广播内容。
  *
  * 本函数只做"配置", 不开始广播 —— 开播由 ble_link_adv_start() 显式触发,
  * 便于调用方控制时机(例如先把传感器跑起来再放出连接入口)。
  *
- * @param rx_handler  收到对端数据的回调, 可传 NULL(此时仅打印日志)。
+ * @param rx_handler   收到对端数据的回调, 可传 NULL(此时仅打印日志)。
+ * @param evt_handler  链路状态事件回调, 可传 NULL(此时仅打印日志)。
+ *                     ⚠ 传 NULL 意味着断开后没人恢复数据广播 —— 本模块
+ *                     不再自动重开播, 详见 ble_link_evt_t 说明。
  *
  * @note 必须在 ble_stack_init() 与 app_timer_init() 之后调用。重复调用安全。
  *
  * @retval NRF_SUCCESS 成功, 否则为底层 SoftDevice / SDK 模块的错误码。
  */
-ret_code_t ble_link_init(ble_link_rx_handler_t rx_handler);
+ret_code_t ble_link_init(ble_link_rx_handler_t  rx_handler,
+                         ble_link_evt_handler_t evt_handler);
 
-/**@brief 开始可连接广播。已在广播中时重复调用安全(直接返回成功)。 */
+/**@brief 开始可连接广播(向 ble_adv_mux 抢占广播集)。
+ *
+ * ⚠ 会抢占: 若当前是数据广播在播, 那边会被停掉。这是"长按打开调试口"
+ *   所需要的行为, 是否该抢由调用方决定。
+ *
+ * 已在广播中时重复调用安全(直接返回成功)。 */
 ret_code_t ble_link_adv_start(void);
 
-/**@brief 停止可连接广播。未在广播时重复调用安全(直接返回成功)。
+/**@brief 停止可连接广播, 把广播集交还给 ble_adv_mux。未在广播时安全。
  *
  * 停播后设备不再可被搜到/连接, 但已建立的连接不受影响 —— 本函数只关广播,
  * 不断开连接。要彻底关掉调试口, 用 ble_link_disconnect() 再调本函数。
- *
- * ⚠ 停播后 ble_link.c 的自动重开播逻辑也随之关闭: 一旦调用过本函数,
- *   后续断开连接不会再自动开播(否则"关"就没有意义了)。要恢复请显式调用
- *   ble_link_adv_start()。
  *
  * @retval NRF_SUCCESS             已停播, 或本来就没在播。
  * @retval NRF_ERROR_INVALID_STATE 模块未初始化。
@@ -175,8 +225,8 @@ ret_code_t ble_link_adv_stop(void);
 
 /**@brief 主动断开当前连接。未连接时直接返回成功。
  *
- * 用于"收到关闭命令后主动挂断"这类场景。断开后是否自动重新开播, 取决于
- * 上一次调用的是 ble_link_adv_start() 还是 ble_link_adv_stop()。
+ * 用于"收到关闭命令后主动挂断"这类场景。断开后会产生
+ * BLE_LINK_EVT_DISCONNECTED, 由上层决定下一步(本模块不自动重开播)。
  *
  * @note 断开是异步的: 本函数返回后还要等 BLE_GAP_EVT_DISCONNECTED 才真正断开。
  */

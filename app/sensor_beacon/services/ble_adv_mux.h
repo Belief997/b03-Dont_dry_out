@@ -11,8 +11,8 @@
  *        Update an existing advertising handle instead."
  *
  *   本工程有两个想广播的模块:
- *       ble_beacon —— 不可连接的传感器数据广播(平时)
- *       ble_link   —— 可连接广播 + NUS 透传(调试/配置窗口)
+ *       ble_beacon —— 不可连接的传感器数据广播(单击触发, 播固定次数就停)
+ *       ble_link   —— 可连接广播 + NUS 透传(长按打开的调试/配置窗口)
  *   若两者各自持有一个 static m_adv_handle, 上面那个错误就是必然的运行期失败。
  *   所以句柄收敛到本模块独占, 两个模块都只提交"内容 + 参数", 不碰句柄。
  *
@@ -22,8 +22,9 @@
  * 仲裁策略(刻意做得极简):
  *   ble_adv_mux_start() 是"抢占式"的 —— 谁调用谁拿走广播集, 原持有者的广播
  *   被直接停掉。本模块【不做】优先级判断, 因为"什么时候该谁播"是应用层策略,
- *   放在这里会让两个模块的时序耦合到仲裁器里。当前工程的策略(平时数据广播、
- *   窗口期可连接广播、连接期间都不播)由 main.c 编排, 见那里的说明。
+ *   放在这里会让两个模块的时序耦合到仲裁器里。当前工程的策略(平时静默、
+ *   单击时数据广播播固定次数、长按时可连接广播占用 30 秒)由 main.c 编排,
+ *   见那里的 adv_policy_* 说明。
  *
  *   ble_adv_mux_stop() 反过来是"礼让式"的: 只有当前持有者能停自己的广播,
  *   传入的 owner 与当前持有者不符时直接返回成功(视作"我的广播本来就没在播")。
@@ -93,27 +94,6 @@ ret_code_t ble_adv_mux_start(ble_adv_owner_t              owner,
                              ble_gap_adv_data_t   const * p_data,
                              ble_gap_adv_params_t const * p_params,
                              int8_t                       tx_power_dbm);
-
-/**@brief 在【不中断广播】的前提下只更新广播数据。
- *
- * 用于"内容变了但参数没变"的场合(典型: 传感器数据刷新), 避免 stop/start
- * 造成广播空档 —— 这是"数据广播全周期存在"能成立的关键。
- *
- * ⚠ 必须传入与当前【不同】的缓冲。协议栈要求:
- *     "In order to update advertising data while advertising,
- *      new advertising buffers must be provided."
- *   复用同一块缓冲会得到 NRF_ERROR_INVALID_STATE
- *     ("It is invalid to provide the same data buffers while advertising")。
- *   调用方通常用双缓冲交替, 见 ble_beacon.c 的做法。
- *
- * @param owner   调用方标识, 必须是当前持有者, 否则返回 NRF_ERROR_INVALID_STATE。
- * @param p_data  新的广播数据(须为不同缓冲)。
- *
- * @retval NRF_SUCCESS             数据已更新, 广播未中断。
- * @retval NRF_ERROR_INVALID_STATE 调用方不是当前持有者, 或当前并未在广播。
- */
-ret_code_t ble_adv_mux_update_data(ble_adv_owner_t            owner,
-                                   ble_gap_adv_data_t const * p_data);
 
 /**@brief 停止自己的广播并交还广播集。
  *

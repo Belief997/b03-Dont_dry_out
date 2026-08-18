@@ -121,31 +121,6 @@ ret_code_t ble_adv_mux_start(ble_adv_owner_t              owner,
     return NRF_SUCCESS;
 }
 
-ret_code_t ble_adv_mux_update_data(ble_adv_owner_t            owner,
-                                   ble_gap_adv_data_t const * p_data)
-{
-    if (p_data == NULL)
-    {
-        return NRF_ERROR_NULL;
-    }
-
-    /* 只有当前持有者能更新, 且必须真的在播 —— 否则"不中断地更新"无意义,
-     * 应该走 ble_adv_mux_start()。 */
-    if ((owner != m_owner) || !m_advertising)
-    {
-        return NRF_ERROR_INVALID_STATE;
-    }
-
-    /* p_adv_params 传 NULL: 这是"广播中只更新数据"的唯一合法调用形式。
-     * ⚠ p_data 必须是与当前不同的缓冲, 否则协议栈返回 INVALID_STATE。 */
-    ret_code_t err = sd_ble_gap_adv_set_configure(&m_adv_handle, p_data, NULL);
-    if (err != NRF_SUCCESS)
-    {
-        NRF_LOG_WARNING("adv data update failed (0x%08x)", err);
-    }
-    return err;
-}
-
 ret_code_t ble_adv_mux_stop(ble_adv_owner_t owner)
 {
     /* 礼让: 不是自己在播就什么都不做。避免 A 的 stop 误伤 B 刚抢到的广播。 */
@@ -204,7 +179,11 @@ static void ble_evt_handler(ble_evt_t const * p_ble_evt, void * p_context)
             break;
 
         case BLE_GAP_EVT_ADV_SET_TERMINATED:
-            /* 限时广播到期(duration != 0 时) */
+            /* 两种情形都会来这里:
+             *   reason = TIMEOUT       —— 限时广播到期(ble_link 的 30s 窗口)
+             *   reason = LIMIT_REACHED —— max_adv_evts 播够(ble_beacon 的 3 次)
+             * 本模块不区分, 只管把"已经不在播了"这个事实记下来;
+             * 区分留给 ble_link / main.c 的观察者(优先级 3, 在本模块之后)。 */
             m_advertising = false;
             break;
 
