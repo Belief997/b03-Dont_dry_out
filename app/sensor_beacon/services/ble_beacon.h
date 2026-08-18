@@ -54,10 +54,8 @@ extern "C" {
  * ⚠ max_adv_evts != 0 在本 SoftDevice(S112 6.0.0)中标注为
  *   "experimental feature"(ble_gap.h:648)。实测若不可用, 退路是把它设回 0
  *   并在应用层用定时器控制窗口(见 git 历史里 ADV_WINDOW_MS 的做法)。 */
-#define BLE_BEACON_ADV_EVENTS       3
-
-#define BLE_BEACON_TX_POWER_DBM     0
-
+#define BLE_BEACON_ADV_EVENTS       15
+#define BLE_BEACON_TX_POWER_DBM     4
 /* 厂商自定义数据的公司标识。0xFFFF 为 SIG 保留(测试用), 与 main.c 一致。 */
 #define BLE_BEACON_COMPANY_ID       0xFFFF
 

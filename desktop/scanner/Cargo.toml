@@ -1,0 +1,14 @@
+[package]
+name = "sensor-beacon-scanner"
+version = "0.1.0"
+edition = "2021"
+description = "sensor_beacon 广播扫描与解析工具(Company ID 0xFFFF, 协议 v0x02)"
+
+[dependencies]
+anyhow = "1"
+btleplug = "0.11.5"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+
+[profile.release]
+opt-level = 2
