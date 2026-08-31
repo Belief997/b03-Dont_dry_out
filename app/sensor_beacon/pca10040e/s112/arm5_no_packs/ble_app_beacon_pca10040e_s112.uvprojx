@@ -310,7 +310,7 @@
               <OCR_RVCT4>
                 <Type>1</Type>
                 <StartAddress>0x19000</StartAddress>
-                <Size>0x17000</Size>
+                <Size>0x13000</Size>
               </OCR_RVCT4>
               <OCR_RVCT5>
                 <Type>1</Type>
@@ -417,6 +417,11 @@
               <FileName>ble_adv_mux.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\..\..\services\ble_adv_mux.c</FilePath>
+            </File>
+            <File>
+              <FileName>app_storage.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\..\..\services\app_storage.c</FilePath>
             </File>
             <File>
               <FileName>ble_beacon.c</FileName>
@@ -1482,6 +1487,16 @@
                   </Cads>
                 </FileArmAds>
               </FileOption>
+            </File>
+            <File>
+              <FileName>nrf_fstorage.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\..\..\..\..\..\components\libraries\fstorage\nrf_fstorage.c</FilePath>
+            </File>
+            <File>
+              <FileName>nrf_fstorage_sd.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\..\..\..\..\..\components\libraries\fstorage\nrf_fstorage_sd.c</FilePath>
             </File>
             <File>
               <FileName>nrf_atfifo.c</FileName>
@@ -2814,7 +2829,7 @@
               <OCR_RVCT4>
                 <Type>1</Type>
                 <StartAddress>0x19000</StartAddress>
-                <Size>0x17000</Size>
+                <Size>0x13000</Size>
               </OCR_RVCT4>
               <OCR_RVCT5>
                 <Type>1</Type>
@@ -2921,6 +2936,11 @@
               <FileName>ble_adv_mux.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\..\..\services\ble_adv_mux.c</FilePath>
+            </File>
+            <File>
+              <FileName>app_storage.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\..\..\services\app_storage.c</FilePath>
             </File>
             <File>
               <FileName>ble_beacon.c</FileName>
@@ -3986,6 +4006,16 @@
                   </Cads>
                 </FileArmAds>
               </FileOption>
+            </File>
+            <File>
+              <FileName>nrf_fstorage.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\..\..\..\..\..\components\libraries\fstorage\nrf_fstorage.c</FilePath>
+            </File>
+            <File>
+              <FileName>nrf_fstorage_sd.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\..\..\..\..\..\components\libraries\fstorage\nrf_fstorage_sd.c</FilePath>
             </File>
             <File>
               <FileName>nrf_atfifo.c</FileName>

@@ -62,6 +62,8 @@
 #include "ble_link.h"
 #include "ble_adv_mux.h"
 #include "ble_beacon.h"
+#include "app_storage.h"
+#include "app_proto.h"
 
 /* ==================================================================
  *  可配置参数(TODO: 按实际硬件/需求修改)
@@ -221,12 +223,20 @@ typedef struct {
     uint8_t idx;                    /* 下一个写入位置 */
     uint8_t count;                  /* 已积累样本数 (0..WINDOW_SIZE) */
     int64_t sum;                    /* 当前窗口内样本总和 */
+    uint32_t last_tick;             /* 最后一次入窗时的 tick 序号(见新鲜度判定) */
 } ma_filter_t;
 
 /* 各通道滑动平均实例(#2 只读 chA) */
 static ma_filter_t m_ma_1a;     /* HX711 #1, Channel A */
 static ma_filter_t m_ma_1b;     /* HX711 #1, Channel B */
 static ma_filter_t m_ma_2a;     /* HX711 #2, Channel A */
+
+/* 采样 tick 计数器 —— 每次 hx711_timer_handler 进来 +1。
+ *
+ * ⚠ 用 tick 序号而不是 app_timer_cnt_get(): 新鲜度只需要"过了几个采样周期"这个
+ *   相对量, 数 tick 最直白, 也不受 RTC 计数器回绕的影响。
+ * ⚠ volatile: 中断里写, 主循环/按键回调里读。 */
+static volatile uint32_t m_sample_tick = 0;
 
 static void ma_init(ma_filter_t * f)
 {
@@ -249,6 +259,7 @@ static void ma_push(ma_filter_t * f, int32_t val)
         f->buf[f->idx] = val;
     }
     f->idx = (uint8_t)((f->idx + 1) % MA_WINDOW_SIZE);
+    f->last_tick = m_sample_tick;
 }
 
 static int32_t ma_avg(const ma_filter_t * f)
@@ -261,6 +272,136 @@ static bool ma_ready(const ma_filter_t * f)
 {
     return (f->count == MA_WINDOW_SIZE);
 }
+
+/* 窗口内的峰峰值(最大 - 最小) —— 稳定判定的度量。
+ *
+ * ⚠ 为什么用峰峰值而不是方差/标准差: 峰峰值只需比较, 不需乘法与开方(定点算
+ *   方差还要防 int64 溢出), 而且对"震荡"这种大幅摆动更灵敏 —— 一个离群点就
+ *   会把峰峰值顶上去, 正是我们想要的保守行为。
+ * ⚠ O(WINDOW) 遍历 = 10 次比较, 每 100ms 一次, 开销可忽略。 */
+static int32_t ma_peak_to_peak(const ma_filter_t * f)
+{
+    if (f->count == 0) return 0;
+
+    int32_t mn = f->buf[0];
+    int32_t mx = f->buf[0];
+    for (uint8_t i = 1; i < f->count; i++)
+    {
+        if (f->buf[i] < mn) mn = f->buf[i];
+        if (f->buf[i] > mx) mx = f->buf[i];
+    }
+    return mx - mn;
+}
+
+/* ==================================================================
+ *  稳定判定 —— 越过"刚放上物体"的震荡阶段
+ * ==================================================================
+ *
+ * 判据: 三个通道【同时】满足 (窗口已满) && (窗口新鲜) && (峰峰值 <= 阈值),
+ *       且连续满足 STABLE_CONFIRM_TICKS 次才报稳定。
+ *
+ * ⚠ 阈值为什么不按"等效克数"定, 而是直接给 counts:
+ *   三通道灵敏度差 4 倍(实测 ch0≈192, ch1≈49, ch2≈200 counts/g —— 与硬件
+ *   增益比 128/32 吻合)。若按"1 g 等效"折算, ch1 的阈值只有 49 counts, 而
+ *   10 样本窗口在 ±30 counts 噪声下的期望峰峰值约 96 counts —— 阈值低于噪声
+ *   底噪, ch1 会【永远判不稳】。实测模拟: 1g 等效阈值的判稳率只有 74%,
+ *   而 300 counts 是 100%。所以阈值的第一约束是"高于噪声底噪", 不是"等效多少克"。
+ *
+ * ⚠ 为什么必须判"新鲜度"而不能只看峰峰值 —— 这是本判定最容易错的地方:
+ *   HX711 #1 是 A 批 10 帧 → 切换(等 ~400ms) → B 批 10 帧 的交替读取, 一批约
+ *   1.4s。在 A 批进行期间, ch1(chB) 的窗口【完全不更新】, 里面是 1.4s 前的
+ *   10 个样本。对这份冻结的数据算峰峰值, 结果往往很小 → 会报告"ch1 稳定",
+ *   但那只是因为数据没变, 不代表传感器现在稳定。所以要求窗口在最近
+ *   STALE_MAX_TICKS 个 tick 内被更新过, 否则报 STALE 而不是 STABLE。
+ *
+ * ⚠ 新鲜度门限必须 > 一批的耗时(约 14 tick), 否则 ch1 在整个 A 批期间都
+ *   "不新鲜", 稳定状态会每 1.4s 抖一次。取一个完整 A+B 循环(28 tick)加余量。
+ *
+ * 抓不住的情况(已知局限, 不在本次范围): 周期远大于窗口长度(1.0s)的极慢漂移。
+ *   实测周期 8s、幅度 2g 的正弦在窗口内峰峰值仅 250 counts, 会被判为稳定。
+ *   那已属温漂而非机械震荡, 要抓需长期基线跟踪。
+ */
+
+/* 峰峰值阈值(counts, 原始计数)。三通道同一个值 —— 见上方"为什么不按克数定"。
+ * 300 counts 折合 ch0/ch2 约 1.5 g、ch1 约 6 g; 对"是否还在震荡"这个判断
+ * 足够, 且远高于 96 counts 的噪声底噪。 */
+#define STABLE_P2P_THRESHOLD        300
+
+/* 连续满足几个 tick 才认定稳定 —— 去掉临界点上的来回抖动。
+ * 模拟显示 1 次与 3 次的判稳耗时只差 ~0.2s, 但 3 次能滤掉偶发的瞬时安静。 */
+#define STABLE_CONFIRM_TICKS        3
+
+/* 窗口最久多少 tick 没更新就算过期。必须 > 一批耗时(~14 tick), 见上方说明。 */
+#define STABLE_STALE_MAX_TICKS      33
+
+/* 当前数据状态 —— APP_PROTO_FLAG_* 的组合。
+ *
+ * ⚠ volatile: 在采样中断里更新, 在按键回调与主循环里读。 */
+static volatile uint16_t m_data_flags = APP_PROTO_FLAG_SETTLING;
+
+/* 连续满足稳定判据的 tick 数。 */
+static uint8_t m_stable_run = 0;
+
+/* 单个通道此刻是否"安静且新鲜"。 */
+static bool ch_is_quiet(const ma_filter_t * f, uint32_t now_tick, bool * p_stale)
+{
+    *p_stale = false;
+
+    if (!ma_ready(f))
+    {
+        /* 窗口还没攒满 —— 开机头 1 秒, 或刚 ma_init 过。既不算稳也不算过期。 */
+        return false;
+    }
+
+    /* ⚠ 减法在无符号域做, 自然处理 m_sample_tick 回绕(32 位 tick @100ms 需
+     *   13.6 年才回绕, 但按无符号差值写就不必假设"永不回绕")。 */
+    if ((uint32_t)(now_tick - f->last_tick) > STABLE_STALE_MAX_TICKS)
+    {
+        *p_stale = true;
+        return false;
+    }
+
+    return (ma_peak_to_peak(f) <= STABLE_P2P_THRESHOLD);
+}
+
+/* 每个采样 tick 末尾调用, 更新 m_data_flags。 */
+static void stability_update(void)
+{
+    uint32_t now = m_sample_tick;
+    bool st1a = false, st1b = false, st2a = false;
+
+    bool quiet = ch_is_quiet(&m_ma_1a, now, &st1a)
+               & ch_is_quiet(&m_ma_1b, now, &st1b)
+               & ch_is_quiet(&m_ma_2a, now, &st2a);
+    /* ⚠ 用 & 而不是 && : 三个 ch_is_quiet 都要执行, 因为它们还负责写出
+     *   各自的 stale 标志。&& 会短路掉后面的调用, stale 就漏报了。 */
+
+    if (st1a || st1b || st2a)
+    {
+        /* 任一通道数据过期 → 整体不可判定。过期优先于"不稳定": 前者是
+         * "不知道", 后者是"知道它在动", 语义不同。 */
+        m_stable_run = 0;
+        m_data_flags = APP_PROTO_FLAG_STALE;
+        return;
+    }
+
+    if (!quiet)
+    {
+        m_stable_run = 0;
+        m_data_flags = APP_PROTO_FLAG_SETTLING;
+        return;
+    }
+
+    if (m_stable_run < STABLE_CONFIRM_TICKS)
+    {
+        m_stable_run++;
+    }
+
+    m_data_flags = (m_stable_run >= STABLE_CONFIRM_TICKS)
+                   ? APP_PROTO_FLAG_STABLE
+                   : APP_PROTO_FLAG_SETTLING;
+}
+
 
 /* ==================================================================
  *  广播负载布局(厂商自定义数据段内的字节偏移)
@@ -635,6 +776,29 @@ STATIC_ASSERT(APP_BLE_CONN_CFG_TAG == BLE_ADV_MUX_CONN_CFG_TAG);
  *   BLE_LINK_EVT_CONNECTED 分支加一次 adv_policy_burst_data() 即可。
  */
 
+/* 待落盘的一条测量数据 —— 中断上下文只填这里, 主循环负责写 flash。
+ *
+ * ⚠ 为什么需要这个中转: app_storage 的写接口内部忙等(见 app_storage.h 文件头),
+ *   不可在中断上下文调用; 而"单击"的按键回调正是中断上下文。
+ * ⚠ m_store_pending 是 volatile: 它被中断写、主循环读, 没有 volatile 编译器
+ *   可能把主循环里的判断优化成"只读一次"。 */
+typedef struct
+{
+    uint16_t batt_mv;
+    int32_t  ch[SENSOR_CH_COUNT];
+    uint16_t flags;                 /* 采样那一刻的数据状态(APP_PROTO_FLAG_*) */
+} store_snap_t;
+
+static store_snap_t      m_store_snap;
+static volatile bool     m_store_pending = false;
+
+/* 从 flash 读出的运行配置(标定参数、饮料类型、广播参数)。
+ *
+ * ⚠ 开机时由 app_storage_cfg_load() 填充; 配置区为空或校验不过时里面是默认值,
+ *   所以【任何时候都可以直接读】, 不需要先判"加载成功了没"。
+ * ⚠ 不是 volatile: 只在主循环上下文读写(中断里不碰它)。 */
+static app_storage_cfg_t m_cfg;
+
 /* 取当前三通道滑动平均 + 重采一次电量, 组装进 m_manuf_data。 */
 static void payload_refresh(void)
 {
@@ -674,6 +838,40 @@ static void adv_policy_burst_data(void)
 
     NRF_LOG_INFO("Data burst started (counter=%u, %u identical packets).",
                  m_counter, BLE_BEACON_ADV_EVENTS);
+
+    /* 把这一份数据也存进 flash。
+     *
+     * ⚠ 这里【只下单, 不落盘】: app_storage 的写接口内部忙等 fstorage 完成
+     *   (要跑 sd_app_evt_wait), 而本函数在 app_timer 中断上下文 —— 在中断里
+     *   等 SOC 事件会真的卡死。所以只把数据抄进快照、置个标志, 由主循环的
+     *   storage_pending_process() 真正写。
+     *
+     * ⚠ 抄的是"刚才 payload_refresh() 用过的同一份数据"吗? 不完全 ——
+     *   payload_refresh() 内部重采了电量, 这里再取一次滑动平均是同一批值
+     *   (滑动平均只在 100ms 定时器里更新, 本函数全程在中断里, 不会被它打断),
+     *   但电量会再采一次 ADC。差异只在几十微秒内的两次 ADC 读数, 可以忽略。
+     *
+     * 若上一条还没被主循环写完就又来一次单击, 后者会覆盖前者的快照 ——
+     * 选覆盖而不是排队: 队列要额外 RAM 与溢出处理, 而"连续快速单击时只存最后
+     * 一条"对本设备是可接受的(用户按一次就是要一条当前读数)。 */
+    m_store_snap.batt_mv = saadc_sample_channel(SAADC_CH_BATTERY);
+    m_store_snap.ch[0]   = ma_avg(&m_ma_1a);
+    m_store_snap.ch[1]   = ma_avg(&m_ma_1b);
+    m_store_snap.ch[2]   = ma_avg(&m_ma_2a);
+
+    /* 连同当时的数据状态一起存 —— 这样上层看回放时能区分"这条是稳定读数"
+     * 还是"用户在震荡期就按了键"。
+     *
+     * ⚠ 这里【不因为不稳定就拒绝存】: 用户按了键就该有一条记录, 拒绝存会让
+     *   人以为设备没反应。把判断权交给读数据的一方, 靠 flags 自证可信度。 */
+    m_store_snap.flags   = m_data_flags;
+    m_store_pending      = true;
+
+    if (!(m_data_flags & APP_PROTO_FLAG_STABLE))
+    {
+        NRF_LOG_WARNING("  data not stable at press time (flags=0x%04x).",
+                        m_data_flags);
+    }
 }
 
 /* 打开可连接广播(抢占广播集; 若数据广播正播到一半, 那半轮被丢弃)。 */
@@ -712,6 +910,35 @@ static void adv_policy_idle(void)
     }
 
     NRF_LOG_INFO("Idle: no advertising until next key press.");
+}
+
+/* 把中断里下单的那条测量数据真正写进 flash。【只能从主循环调】。
+ *
+ * ⚠ 本函数会阻塞若干毫秒: app_storage_rec_append() 内部忙等 fstorage 完成,
+ *   且每写满一页前要先擦一页(擦一页典型 87ms)。主循环阻塞这段时间是安全的
+ *   —— 中断(按键、HX711 定时器、SoftDevice)照常抢占, 忙等里跑的
+ *   sd_app_evt_wait() 本身就是低功耗等待。 */
+static void storage_pending_process(void)
+{
+    if (!m_store_pending)
+    {
+        return;
+    }
+
+    /* 先清标志再取数据: 万一写 flash 期间又来一次单击, 那次的快照能正常
+     * 覆盖并置起标志, 下一轮主循环再写 —— 不会因为"先写后清"而被漏掉。 */
+    m_store_pending = false;
+    store_snap_t snap = m_store_snap;
+
+    ret_code_t err = app_storage_rec_append(snap.batt_mv, snap.ch, snap.flags);
+    if (err != NRF_SUCCESS)
+    {
+        NRF_LOG_WARNING("record append failed (0x%08x)", err);
+        return;
+    }
+
+    NRF_LOG_INFO("Record stored (%u/%u used).",
+                 app_storage_rec_count(), (uint32_t)APP_STORAGE_REC_CAPACITY);
 }
 
 /* ==================================================================
@@ -960,6 +1187,11 @@ static void hx711_timer_handler(void * p_context)
 {
     (void)p_context;
 
+    /* ⚠ 必须在任何 ma_push() 之前自增: ma_push 会把当前 tick 记进
+     *   f->last_tick 作为新鲜度基准, 顺序反了会让本 tick 入窗的数据看起来
+     *   "旧了一个 tick"。 */
+    m_sample_tick++;
+
     int32_t v;
     bool    new1 = false, new2 = false;
 
@@ -1023,6 +1255,25 @@ static void hx711_timer_handler(void * p_context)
     {
         NRF_LOG_INFO("HX711 avg:  1:chA=%6ld chB=%6ld  2:chA=%6ld",
                      ma_avg(&m_ma_1a), ma_avg(&m_ma_1b), ma_avg(&m_ma_2a));
+    }
+
+    /* ---- 稳定判定 ---- */
+    {
+        uint16_t prev = m_data_flags;
+        stability_update();
+
+        /* 只在状态【变化】时打日志 —— 每 tick 都打会把串口刷满, 而这个状态
+         * 大部分时间不变。 */
+        if (m_data_flags != prev)
+        {
+            const char * name = (m_data_flags & APP_PROTO_FLAG_STABLE)   ? "STABLE"
+                              : (m_data_flags & APP_PROTO_FLAG_STALE)    ? "STALE"
+                              :                                            "SETTLING";
+            NRF_LOG_INFO("Data state -> %s  (p2p: %ld / %ld / %ld, thr %d)",
+                         name,
+                         ma_peak_to_peak(&m_ma_1a), ma_peak_to_peak(&m_ma_1b),
+                         ma_peak_to_peak(&m_ma_2a), STABLE_P2P_THRESHOLD);
+        }
     }
 }
 
@@ -1255,6 +1506,24 @@ int main(void)
      *        深度唤醒走 GPIO SENSE, 是另一条路径, 当前分支未启用。 */
     wake_pin_irq_init();
 
+    /* 3.9) flash 尾部的配置区 + 测量数据区。
+     *      ⚠ 必须在 ble_stack_init() 之后 —— nrf_fstorage_sd 要向 SDH 注册
+     *        SOC 事件观察者(见 app_storage.h 文件头)。
+     *      init 失败不致命(只是存不了数据), 所以不 APP_ERROR_CHECK。 */
+    {
+        ret_code_t err = app_storage_init();
+        if (err != NRF_SUCCESS)
+        {
+            NRF_LOG_WARNING("app_storage init failed (0x%08x); records disabled.", err);
+        }
+
+        /* ⚠ 无论 init 成功与否都要调 cfg_load: init 失败时它会返回
+         *   NRF_ERROR_INVALID_STATE 但【仍然把默认值填进 m_cfg】—— 这样
+         *   m_cfg 永远是可用的, 后面所有读它的地方不必判空。
+         *   返回值故意忽略: "没有有效配置"是正常开局(首次上电), 不是错误。 */
+        (void)app_storage_cfg_load(&m_cfg);
+    }
+
     /* 4) 创建周期定时器 —— 100ms 非阻塞采样:
      *    每 tick 仅"尝试读"(就绪才读, 未就绪跳过), 无忙等, 回调耗时微秒级。
      *    模块 10Hz 模式下: #2 单通道连读可达满速 10Hz; #1 因交替切换需在
@@ -1275,13 +1544,17 @@ int main(void)
                  BLE_LINK_DEVICE_NAME, BLE_LINK_ADV_DURATION_MS / 1000);
     NRF_LOG_INFO("  double -> close connectable window / disconnect");
     NRF_LOG_INFO("BLE: silent until a key press (no periodic advertising).");
+    NRF_LOG_INFO("Storage: %u/%u records, cfg @0x%05x, data @0x%05x.",
+                 app_storage_rec_count(), (uint32_t)APP_STORAGE_REC_CAPACITY,
+                 APP_STORAGE_CFG_ADDR, APP_STORAGE_REC_ADDR);
     NRF_LOG_INFO("WAKE_PIN P0.%02u: drive it high/low externally to see edge logs.",
                  WAKE_PIN);
     NRF_LOG_FLUSH();
 
-    /* 5) 主循环: 空闲 + 刷新日志（日志后端若配置为 UART 则从串口输出） */
+    /* 5) 主循环: 落盘待存数据 + 空闲 + 刷新日志（日志后端若配置为 UART 则从串口输出） */
     for (;;)
     {
+        storage_pending_process();
         nrf_pwr_mgmt_run();
     }
 #endif
