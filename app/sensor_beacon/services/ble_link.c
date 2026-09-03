@@ -23,6 +23,7 @@
 #include "nordic_common.h"
 #include "app_error.h"
 #include "app_timer.h"
+#include "app_util.h"       /* STATIC_ASSERT —— 兜住设备名的 31 字节预算 */
 
 #include "ble.h"
 #include "ble_hci.h"
@@ -64,6 +65,19 @@ static bool                     m_inited      = false;
 static uint16_t                 m_conn_handle = BLE_CONN_HANDLE_INVALID;
 static ble_link_rx_handler_t    m_rx_handler  = NULL;
 static ble_link_evt_handler_t   m_evt_handler = NULL;
+
+/* 实际广播名: 前缀 + "_" + MAC 后两字节的大写十六进制 + NUL。
+ *
+ * 初值【只有前缀】而不是空串: 万一 MAC 还没读到(init 之前)就有人打日志, 拿到的
+ * 是"不完整但可读"的名字, 而不是空串让人以为名字丢了。 */
+static char m_dev_name[sizeof(BLE_LINK_DEVICE_NAME_BASE) + BLE_LINK_NAME_SUFFIX_LEN]
+                = BLE_LINK_DEVICE_NAME_BASE;
+
+/* 名字必须放得进广播包, 否则 ble_advdata_encode() 会静默降级成 Short Local Name
+ * 把它截断(不报错), 空中名字与代码里的不一致且无人提示。
+ * 预算: 31 - Flags 段(3) - 名字段头(2) = 26 字符。 */
+STATIC_ASSERT((sizeof(m_dev_name) - 1) <=
+              (BLE_GAP_ADV_SET_DATA_SIZE_MAX - AD_TYPE_FLAGS_SIZE - AD_DATA_OFFSET));
 
 /* 注意这里【没有】m_adv_handle: 广播句柄由 ble_adv_mux 独占(S112 只有一个
  * 广播集), 本模块只提交"内容 + 参数"。也没有 m_advertising ——
@@ -296,18 +310,77 @@ static void qwr_error_handler(uint32_t nrf_error)
     NRF_LOG_WARNING("qwr error (0x%08x)", nrf_error);
 }
 
+/* 把 MAC 后两字节追加成名字后缀: m_dev_name = 前缀 + "_" + "ABCD"。
+ *
+ * ⚠ ble_gap_addr_t::addr 是【小端】(addr[0] 为最低字节), 而手机扫描列表里显示的
+ *   MAC 是 addr[5]:addr[4]:...:addr[0]。所以"显示形式的后四位"= addr[1] 再 addr[0],
+ *   两字节的先后不能反 —— 反了名字后缀和地址后四位对不上, 加后缀这件事就白做了。
+ *
+ * ⚠ 不用 snprintf("%02X"): 那会把 C 库的格式化实现拖进 flash(几 KB), 而这里要做的
+ *   只是 4 次查表。手工展开既短也更明确。
+ *
+ * ⚠ 幂等: 每次都从固定前缀长度处开始写, 所以重复调用不会把后缀叠加成
+ *   "water_ABCD_ABCD"。 */
+static ret_code_t device_name_build(void)
+{
+    static const char HEX[] = "0123456789ABCDEF";
+
+    ble_gap_addr_t addr;
+
+    /* 只能在 SoftDevice 使能后调用 —— 本函数只被 gap_params_init() 用,
+     * 而 ble_link_init() 的前置条件(见头文件)已经保证了这一点。 */
+    ret_code_t err = sd_ble_gap_addr_get(&addr);
+    if (err != NRF_SUCCESS)
+    {
+        /* 读不到地址就保持"只有前缀"的名字继续跑: 名字不好看是显示问题,
+         * 不值得让整个链路初始化失败。调用方据此只记警告, 不中断 init。 */
+        NRF_LOG_WARNING("addr_get failed (0x%08x); name stays \"%s\".",
+                        err, m_dev_name);
+        return err;
+    }
+
+    size_t n = strlen(BLE_LINK_DEVICE_NAME_BASE);
+
+    m_dev_name[n++] = '_';
+    m_dev_name[n++] = HEX[(addr.addr[1] >> 4) & 0x0F];
+    m_dev_name[n++] = HEX[ addr.addr[1]       & 0x0F];
+    m_dev_name[n++] = HEX[(addr.addr[0] >> 4) & 0x0F];
+    m_dev_name[n++] = HEX[ addr.addr[0]       & 0x0F];
+    m_dev_name[n]   = '\0';
+
+    /* ⚠ 本 SDK 的日志一条最多 6 个格式参数(LOG_INTERNAL_6), 故 MAC 与名字分两条打。
+     * ⚠ %s 传的是静态缓冲(不是栈上的), 无需 NRF_LOG_PUSH —— 即便日志改成
+     *   deferred 模式, 刷出时这块内存依然有效且内容不再变化。 */
+    NRF_LOG_INFO("MAC %02X:%02X:%02X:%02X:%02X:%02X",
+                 addr.addr[5], addr.addr[4], addr.addr[3],
+                 addr.addr[2], addr.addr[1], addr.addr[0]);
+    NRF_LOG_INFO("  addr_type %u (1=random static) -> device name \"%s\"",
+                 addr.addr_type, m_dev_name);
+
+    return NRF_SUCCESS;
+}
+
 static ret_code_t gap_params_init(void)
 {
     ret_code_t              err;
     ble_gap_conn_params_t   gap_conn_params;
     ble_gap_conn_sec_mode_t sec_mode;
 
+    /* 先把带 MAC 后缀的名字拼出来, 再设进协议栈。
+     * 失败不阻断: device_name_build() 已经退回"只有前缀"的可用名字。 */
+    (void)device_name_build();
+
     /* 设备名开放读取, 无需加密 */
     BLE_GAP_CONN_SEC_MODE_SET_OPEN(&sec_mode);
 
+    /* ⚠ 这里设的是 GAP 设备名, 而广播包里的名字是 ble_advdata_encode() 在
+     *   advertising_config() 里用 sd_ble_gap_device_name_get() 读回来编码的 ——
+     *   所以设完这一次就够了, 不需要在广播数据里再写一遍名字。
+     *   反过来说: 本调用必须排在 advertising_config() 之前, 否则广播包里
+     *   编进去的还是协议栈默认的 "nRF5x"。 */
     err = sd_ble_gap_device_name_set(&sec_mode,
-                                     (const uint8_t *)BLE_LINK_DEVICE_NAME,
-                                     strlen(BLE_LINK_DEVICE_NAME));
+                                     (const uint8_t *)m_dev_name,
+                                     strlen(m_dev_name));
     if (err != NRF_SUCCESS)
     {
         return err;
@@ -458,7 +531,7 @@ ret_code_t ble_link_init(ble_link_rx_handler_t  rx_handler,
     m_inited = true;
 
     NRF_LOG_INFO("BLE link ready: name=\"%s\", NUS transparent (not advertising yet).",
-                 BLE_LINK_DEVICE_NAME);
+                 m_dev_name);
     NRF_LOG_INFO("  adv interval %ums, window %us, max payload %u bytes",
                  BLE_LINK_ADV_INTERVAL_MS, BLE_LINK_ADV_DURATION_MS / 1000,
                  ble_link_max_data_len());
@@ -496,7 +569,7 @@ ret_code_t ble_link_adv_start(void)
     }
 
     NRF_LOG_INFO("Advertising as \"%s\" (connectable, %us window).",
-                 BLE_LINK_DEVICE_NAME, BLE_LINK_ADV_DURATION_MS / 1000);
+                 m_dev_name, BLE_LINK_ADV_DURATION_MS / 1000);
     return NRF_SUCCESS;
 }
 
@@ -535,6 +608,11 @@ ret_code_t ble_link_disconnect(void)
      * 故此处不清 m_conn_handle, 交给事件分支统一清理。 */
     return sd_ble_gap_disconnect(m_conn_handle,
                                  BLE_HCI_REMOTE_USER_TERMINATED_CONNECTION);
+}
+
+const char * ble_link_device_name(void)
+{
+    return m_dev_name;
 }
 
 bool ble_link_is_advertising(void)

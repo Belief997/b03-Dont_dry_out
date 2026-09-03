@@ -1540,8 +1540,11 @@ int main(void)
     NRF_LOG_INFO("KEY/LED active: KEY=P0.%02u LED=P0.%02u", DRV_KEY_PIN, DRV_LED_PIN);
     NRF_LOG_INFO("  single -> flash + %u identical data packets",
                  BLE_BEACON_ADV_EVENTS);
+    /* ⚠ 打的是 ble_link_device_name() 而不是 BLE_LINK_DEVICE_NAME_BASE:
+     *   实际广播名带 MAC 后缀(如 "water_ABCD"), 打前缀会与手机上看到的不一致。
+     *   本行在 ble_start() 之后 → 后缀已拼好。 */
     NRF_LOG_INFO("  long   -> connectable \"%s\" for %us",
-                 BLE_LINK_DEVICE_NAME, BLE_LINK_ADV_DURATION_MS / 1000);
+                 ble_link_device_name(), BLE_LINK_ADV_DURATION_MS / 1000);
     NRF_LOG_INFO("  double -> close connectable window / disconnect");
     NRF_LOG_INFO("BLE: silent until a key press (no periodic advertising).");
     NRF_LOG_INFO("Storage: %u/%u records, cfg @0x%05x, data @0x%05x.",

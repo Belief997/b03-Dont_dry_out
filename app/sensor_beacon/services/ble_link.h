@@ -51,12 +51,14 @@
  *     把传感器数据(厂商自定义段)和设备名一起放进同一个【可连接】广播包。
  *     网关照常解析厂商段拿数据, 手机照常搜到名字并连上 —— 一个广播集
  *     同时满足两个用途, 不需要切换, 也就不存在"数据广播中断"。
- *     字节预算(实测 ble_advdata_encode, 上限 31):
+ *     字节预算(实测 ble_advdata_encode, 上限 31; ⚠ 下列实测值是名字为 5 字符
+ *     "water" 时测的, 现在名字带了 MAC 后缀变成 10 字符, 每项要再减 5 字节):
  *         名字 "water" + 16 字节厂商载荷 → 占 30 字节, 通过
  *         名字 "water" + 17 字节厂商载荷 → 占 31 字节, 通过(刚好用满)
  *         名字 "water" + 18 字节起        → NRF_ERROR_DATA_SIZE
- *       即当前载荷(MANUF_DATA_LEN=16)只剩 1 字节可加。要加更多字段就得
- *       缩短设备名: 名字缩到 "wtr" 可放 18 字节, 缩到 "w" 可放 20 字节。
+ *       即名字 5 字符时载荷上限 17。换成 10 字符的带后缀名字后上限只有 12 字节,
+ *       【装不下当前的 MANUF_DATA_LEN=16】—— 所以方案 A 若要启用, 得先缩短名字
+ *       (或去掉后缀), 不能照抄上面这组数字。
  *     NUS 的 128bit UUID 本来就在扫描响应包里(独立 31 字节), 不占这份预算。
  *     代价: 数据广播期间设备始终可被连接 —— 若"平时不许连"是安全需求,
  *           则不能用本方案(明文透传口的鉴权问题见下方 SEC_PARAMS 处说明)。
@@ -120,10 +122,55 @@
 extern "C" {
 #endif
 
-/* 广播名(Complete Local Name)。暂定 "water"。
- * ⚠ 改长了要留意广播包 31 字节预算: Flags(3) + 名字(2+strlen) 必须放得下,
+/* 广播名(Complete Local Name)的固定前缀。
+ *
+ * 实际播出去的名字 = 前缀 + "_" + MAC 后两字节的大写十六进制, 例如
+ * MAC C3:9A:12:34:AB:CD → "water_ABCD"。完整名字用 ble_link_device_name() 取,
+ * 【不要】直接拿这个宏去打印或比较 —— 那会漏掉后缀。
+ *
+ * ⚠ 为什么加后缀: 之前所有板子都叫 "water", 同场多台设备在手机扫描列表里无法
+ *   分辨。取 MAC 而不是 FICR->DEVICEID 是因为前者就是扫描列表里显示的地址,
+ *   名字后四位与地址后四位一致, 肉眼即可对上是哪台。
+ *
+ * ⚠ 改长了要留意广播包 31 字节预算: Flags(3) + 名字段(2 + 名字长度) 必须放得下,
+ *   即名字 <= 26 字符。超了 ble_advdata_encode() 【不返回错误】, 而是静默降级成
+ *   Short Local Name 把名字截断(见 ble_advdata.c 的 name_encode)—— 空中名字变短
+ *   却无人报错, 很难查。ble_link.c 里有编译期断言兜住这一点。
  *   NUS 的 128bit UUID 已挪到扫描响应包里, 不占这 31 字节。 */
-#define BLE_LINK_DEVICE_NAME        "water"
+#define BLE_LINK_DEVICE_NAME_BASE   "water"
+
+/* 名字后缀的字符数: '_' + 4 位十六进制。 */
+#define BLE_LINK_NAME_SUFFIX_LEN    5
+
+/* ==================================================================
+ *  MAC(GAP identity address)是怎么来的, 以及要改的话怎么改
+ * ==================================================================
+ *
+ * 本工程【没有】设置过 MAC —— 用的是 SoftDevice 的默认行为:
+ *   sd_softdevice_enable() 时协议栈自动装上一个 BLE_GAP_ADDR_TYPE_RANDOM_STATIC
+ *   地址, 取自芯片出厂时烧进 FICR->DEVICEADDR[0..1] 的随机数, 每颗芯片唯一且
+ *   终生不变(s112/headers/ble_gap.h 的 sd_ble_gap_addr_set 注释原文:
+ *   "populated during the IC manufacturing process and remains unchanged for the
+ *   lifetime of each IC")。所以名字后缀天然就是"这颗芯片的身份", 不需要标定,
+ *   也不会因为重启或重新烧写而变。
+ *
+ * ⚠ Random static 地址的高两位被协议栈强制置成 11, 即 addr[5] |= 0xC0 ——
+ *   所以观察到的 MAC 首字节总在 C0..FF, 这不是 bug。
+ *
+ * 真要改成自定的地址, 用 sd_ble_gap_addr_set(&addr), 约束如下(均来自 ble_gap.h):
+ *   - addr_type 只能是 BLE_GAP_ADDR_TYPE_PUBLIC 或 ..._RANDOM_STATIC;
+ *     两种 private 类型不能用这个 API 设, 要走 sd_ble_gap_privacy_set();
+ *   - 选 RANDOM_STATIC 时 addr[5] 的高两位必须是 11, 否则返回
+ *     BLE_ERROR_GAP_INVALID_BLE_ADDR;
+ *   - 选 PUBLIC 意味着声称拥有一个 IEEE 分配的 OUI, 没买 OUI 就别用;
+ *   - 广播期间不能改, 会返回 NRF_ERROR_INVALID_STATE → 必须在
+ *     ble_link_adv_start() 之前(本模块的 init 阶段)调用;
+ *   - addr[] 是【小端】: addr[0] 是最低字节, 手机上显示的 MAC 是
+ *     addr[5]:addr[4]:...:addr[0]。填反了名字后缀与扫描列表就对不上。
+ *
+ * 若日后要"MAC 可配置", 落点是 app_storage 的配置区(加 6 字节字段 + 一个
+ * "是否启用自定义 MAC"的标志), 并在 ble_link_init() 最前面 set 一次。
+ * 当前不做 —— 出厂唯一地址已经满足"能区分设备"这个唯一需求。 */
 
 /* 广播间隔(ms)。可连接广播, 40ms 是"搜得快"与"功耗可接受"的常用折中。 */
 #define BLE_LINK_ADV_INTERVAL_MS    40
@@ -187,6 +234,17 @@ typedef void (*ble_link_evt_handler_t)(ble_link_evt_t evt);
 
 /**@brief 事件名字符串(用于日志打印)。 */
 const char * ble_link_evt_str(ble_link_evt_t evt);
+
+/**@brief 实际播出去的完整广播名(BLE_LINK_DEVICE_NAME_BASE + "_" + MAC 后四位),
+ *        以 NUL 结尾, 指向模块内的静态缓冲, 调用方不要修改也不必拷贝。
+ *
+ * 后缀在 ble_link_init() 里组装 —— sd_ble_gap_addr_get() 要求 SoftDevice 已使能,
+ * 所以拿不到更早。
+ *
+ * @note 在 ble_link_init() 之前调用会返回【只有前缀】的名字(那时还没读到 MAC),
+ *       而不是空串或野指针 —— 这样日志可以无条件调用它, 不用判初始化状态。
+ */
+const char * ble_link_device_name(void);
 
 /**@brief 初始化 GAP / GATT / NUS / 连接参数协商, 并准备好广播内容。
  *

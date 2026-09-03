@@ -613,8 +613,12 @@ const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
 const NUS_RX_CHAR = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
 const NUS_TX_CHAR = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
 
-/* 设备端 BLE_LINK_DEVICE_NAME。用于 requestDevice 的名字过滤。 */
-const BLE_DEVICE_NAME = 'water';
+/* 设备端 BLE_LINK_DEVICE_NAME_BASE。用于 requestDevice 的名字【前缀】过滤。
+ *
+ * ⚠ 只能按前缀匹配, 不能按全名: 固件的实际广播名是 前缀 + "_" + MAC 后四位
+ *   (如 "water_ABCD", 见 ble_link.c 的 device_name_build), 每台设备都不一样。
+ *   用 filters:[{name:'water'}] 会一台都匹配不到。 */
+const BLE_DEVICE_NAME_PREFIX = 'water';
 
 /* ==================================================================
  *  状态
@@ -1339,7 +1343,7 @@ async function bleGattConnect(){
   try{
     addLog('[BLE] 请先长按设备按键打开 30 秒可连接窗口, 再在弹窗中选择设备。', 'sys');
     const device = await navigator.bluetooth.requestDevice({
-      filters:[{ name: BLE_DEVICE_NAME }, { services:[NUS_SERVICE] }],
+      filters:[{ namePrefix: BLE_DEVICE_NAME_PREFIX }, { services:[NUS_SERVICE] }],
       optionalServices:[NUS_SERVICE],
     });
     state.ble.device = device;
@@ -1366,7 +1370,7 @@ async function bleGattConnect(){
     $('nusMtu').textContent = state.ble.mtu;
 
     banner('');
-    setStatus(`已连接 ${device.name || BLE_DEVICE_NAME}`, 'on');
+    setStatus(`已连接 ${device.name || BLE_DEVICE_NAME_PREFIX}`, 'on');
     $('btnGatt').disabled = true;
     $('btnGattStop').disabled = false;
     $('nusInput').disabled = false;
