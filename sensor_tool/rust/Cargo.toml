@@ -1,0 +1,25 @@
+[package]
+name = "sensor_tool_core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+flutter_rust_bridge = "=2.13.0"
+
+# BLE central。版本与 dev/desktop/scanner 对齐 —— 那个工具已经在这台机器上实测过
+# winrtble 后端的行为(见 scanner/README.md 的「漏收问题」一节: Windows 每 ~1.3s
+# 才开一次扫描窗口)。换版本等于把那批实测结论作废。
+btleplug = "0.11.5"
+
+# btleplug 是 async 的, 而 FRB 自己的执行器不是 tokio, 所以本 crate 自持一个
+# runtime(见 src/ble/mod.rs 的 RT)。
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tokio-stream = "0.1"
+
+anyhow = "1"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }
