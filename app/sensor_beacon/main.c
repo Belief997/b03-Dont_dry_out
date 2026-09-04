@@ -135,6 +135,19 @@
 #define GPREGRET_ID_COUNTER         0
 
 /* ==================================================================
+ *  LATCH 实测探针的总开关(分支 4)
+ * ==================================================================
+ *
+ * 置 1 后 main() 只跑 LATCH 探针(实现与完整实验设计见本文件 "分支 4" 一节,
+ * 就在 rearm_and_off() 下面), 分支 1 的 HX711/按键/BLE 全部不编译 ——
+ * 两者互斥, 因为探针不返回。
+ *
+ * 这不是功能代码, 是一次【一次性实验】: 验证 GPIO->LATCH 能否跨 System OFF
+ * 唤醒复位保留。结论决定"多唤醒脚时怎么反推是哪个脚醒的"该怎么写。
+ * 测完请改回 0。 */
+#define LATCH_PROBE_ENABLED         0
+
+/* ==================================================================
  *  HX711 引脚 & 参数
  * ==================================================================
  *
@@ -521,6 +534,216 @@ static void rearm_and_off(nrf_gpio_pin_sense_t sense)
     nrf_gpio_cfg_sense_set(WAKE_PIN, sense);
     system_off_direct();
 }
+
+/* ==================================================================
+ *  分支 4 —— LATCH 实测探针: GPIO->LATCH 能否跨 System OFF 唤醒保留?
+ * ==================================================================
+ *
+ * 【要回答的问题】
+ *
+ * System OFF 唤醒等于复位, 而 RESETREAS 只有一个 OFF 位(bit16), 它只说明
+ * "本次是被 DETECT 唤醒的", 【不说是哪个脚】。所以一旦同时武装多个唤醒脚,
+ * 就需要别的手段反推唤醒源。候选有两个:
+ *
+ *   A) 开机读各脚电平 —— 分支 3 的 boot_read_and_classify() 就是这么干的。
+ *      缺陷: 若外部信号是短脉冲, 醒过来时电平已经变回去了, 反推失败。
+ *   B) 读 GPIO->LATCH —— 每脚一位(GPIO_LATCH_PIN0..PIN31), 只要该脚的 SENSE
+ *      判据【曾经】满足过就置 1, 是粘滞的, 不怕脉冲。
+ *
+ * B 明显更好, 但它成立的前提无法从本仓库内证实(数据手册不在树里):
+ * "LATCH 在 System OFF 唤醒复位之后还在不在"。本探针就是为了实测这一条。
+ *
+ * 【已核对的事实 —— 基于 SDK 头文件, 不是记忆】
+ *
+ *   - SENSE 是每个脚 PIN_CNF[n] 里的 2 位字段(nrf52810_bitfields.h 的
+ *     GPIO_PIN_CNF_SENSE_Pos = 16), 不是共享通道资源 → 唤醒脚数量【不受
+ *     预算限制】, 32 个 GPIO 都能同时武装。别与 GPIOTE 的 8 个通道搞混。
+ *   - LATCH 是【写 1 清除】(见 nrf_gpio_pin_latch_clear: reg->LATCH = 1<<pin)。
+ *   - nrfx_gpiote.c 【完全没碰】DETECTMODE, 所以它停在 Default(DETECT 直连
+ *     引脚)而非 LDETECT。本探针也不切: LATCH 的置位与 DETECTMODE 无关,
+ *     DETECTMODE 只决定 DETECT 信号从哪里取。
+ *   - nRF52810 【无 LPCOMP、无 NFCT】(nrf52810_peripherals.h 里只有
+ *     COMP_PRESENT), 所以 System OFF 的唤醒源只有 GPIO DETECT + 复位脚 +
+ *     调试器三种。"用片内比较器唤醒"这条路在这颗芯片上不存在。
+ *   - nRF52810 上【没有 NRF_GPIO 这个符号】, 只有 NRF_P0(NRF_GPIO 别名仅在
+ *     legacy 兼容头 nrf51_to_nrf52810.h 里)。所以下面一律走 nrf_gpio HAL,
+ *     只有"清全部 latch"没有 HAL 对应函数, 才直接写 NRF_P0->LATCH。
+ *
+ * 【实验设计 —— 顺序是关键, 错一步结论就不成立】
+ *
+ *   进 OFF 前: ① 读电平 → ② 武装 SENSE 到【相反】方向 → ③ 清 LATCH
+ *              → ④ 回读 LATCH 自检 → ⑤ 写 SYSTEMOFF
+ *   醒来之后:  ⑥ main() 第一批指令里快照 RESETREAS + LATCH + 电平 → ⑦ 打印
+ *
+ * ⚠ ③ 必须在 ② 【之后】。武装 SENSE 的那一刻若引脚已满足判据, 硬件会立刻置
+ *   LATCH。若先清后武装, 这个"武装动作自己造出来的 latch"会留在寄存器里 ——
+ *   醒来读到 1, 却分不清是本次休眠期间的外部信号还是武装动作自造的,
+ *   整个实验就白做了。
+ *
+ * ⚠ ④ 是数据可信度自检。清完立刻又变 1 → 该脚判据【持续】满足(例如武装了
+ *   SENSE_LOW 而外部一直是低), 那这一轮根本进不去 OFF 或者立刻就醒。此时
+ *   探针打印 "ARM CONFLICT" 并明确说明本轮数据作废, 而不是给出错误结论。
+ *
+ * ⚠ ⑥ 必须是 main() 的最前面。任何对 PIN_CNF 的写都可能改变 LATCH ——
+ *   log_init() 配 UART 引脚(P0.06)也算。所以"快照"与"打印"拆成两个函数:
+ *   快照在 log_init() 之前, 打印在之后。
+ *
+ * ⚠⚠ 【必须断开 SWD 调试器再跑】。调试器连着时 System OFF 被仿真, 芯片不会
+ *   真的复位 —— 那样测到的是"运行态 LATCH 保不保留", 与要问的问题无关, 而且
+ *   会得到一个假的"保留"结论。正确做法: 电池或 USB 供电, 只接 UART
+ *   (P0.06, 115200 8N1)看日志。探针自己会检查 RESETREAS.OFF, 若为 0 会直接
+ *   警告"这不是 System OFF 唤醒"。
+ */
+
+#if LATCH_PROBE_ENABLED
+
+/* 探针要武装的候选唤醒脚。两个都武装 —— 顺带验证"多脚唤醒能否靠 LATCH 区分"。
+ *   DRV_KEY_PIN(P0.14) : 按键, 上拉 + active-low, 静态高 → 无漏流, 最理想
+ *   WAKE_PIN   (P0.22) : 外部信号 */
+static const uint8_t m_probe_pins[] = { DRV_KEY_PIN, WAKE_PIN };
+#define PROBE_PIN_COUNT     (sizeof(m_probe_pins) / sizeof(m_probe_pins[0]))
+
+/* 醒来第一时间的寄存器快照。 */
+typedef struct
+{
+    uint32_t resetreas;
+    uint32_t latch;                     /* 整个 P0 的 LATCH, 32 位 */
+    uint32_t round;                     /* 第几轮(存 GPREGRET2, 跨 OFF 保持) */
+    uint8_t  level[PROBE_PIN_COUNT];    /* 各候选脚的即时电平 */
+} latch_probe_t;
+
+/* ⚠ 必须是 main() 的第一批指令, 见上方 ⑥。本函数【只读不改】GPIO。 */
+static void latch_probe_snapshot(latch_probe_t * p)
+{
+    p->resetreas = NRF_POWER->RESETREAS;
+
+    /* 先把 LATCH 抓走, 后面一个字节都别动 GPIO。
+     * 用 HAL 而不是 NRF_P0->LATCH: 前者在 GPIO_COUNT>1 的芯片上也对。 */
+    nrf_gpio_latches_read(0, 1, &p->latch);
+
+    for (uint8_t i = 0; i < PROBE_PIN_COUNT; i++)
+    {
+        p->level[i] = (uint8_t)nrf_gpio_pin_read(m_probe_pins[i]);
+    }
+
+    /* GPREGRET2 而不是 GPREGRET: 0 号被应用的事件计数器占着
+     * (GPREGRET_ID_COUNTER), 借来用会把两个实验的状态搅在一起。 */
+    p->round = NRF_POWER->GPREGRET2;
+
+    NRF_POWER->RESETREAS = 0xFFFFFFFF;      /* 写 1 清除, 便于下一轮判定 */
+}
+
+/* 打印快照 → 武装唤醒脚 → 进 System OFF。【不返回】。 */
+static void latch_probe_run(const latch_probe_t * p)
+{
+    bool woke_from_off = (p->resetreas & POWER_RESETREAS_OFF_Msk) != 0;
+
+    NRF_LOG_INFO("======== LATCH PROBE round #%u ========", p->round);
+    NRF_LOG_INFO("  RESETREAS = 0x%08x  [OFF=%u RESETPIN=%u SREQ=%u]",
+                 p->resetreas,
+                 woke_from_off ? 1u : 0u,
+                 (p->resetreas & POWER_RESETREAS_RESETPIN_Msk) ? 1u : 0u,
+                 (p->resetreas & POWER_RESETREAS_SREQ_Msk)     ? 1u : 0u);
+    NRF_LOG_INFO("  LATCH     = 0x%08x", p->latch);
+
+    for (uint8_t i = 0; i < PROBE_PIN_COUNT; i++)
+    {
+        uint8_t pin = m_probe_pins[i];
+        NRF_LOG_INFO("    P0.%02u : latch=%u  level=%s",
+                     pin,
+                     (p->latch >> pin) & 1u,
+                     p->level[i] ? "HIGH" : "LOW");
+    }
+
+    /* ---------------- 结论判定 ---------------- */
+    if (p->round == 0)
+    {
+        /* 冷启动(上电/掉电复位会清 GPREGRET2)。这一轮 RESETREAS 里没有 OFF 位,
+         * LATCH 也没有意义 —— 只负责武装然后睡下去。结论从第 1 轮开始看。 */
+        NRF_LOG_INFO("  verdict   : 冷启动, 本轮只武装。");
+        NRF_LOG_INFO("              请触发一次唤醒(按键 或 拉动 P0.%02u), 看下一轮。",
+                     WAKE_PIN);
+    }
+    else if (!woke_from_off)
+    {
+        NRF_LOG_WARNING("  verdict   : 本次【不是】System OFF 唤醒 (RESETREAS.OFF=0)。");
+        NRF_LOG_WARNING("              本轮数据无效。最常见原因: SWD 调试器还连着,");
+        NRF_LOG_WARNING("              System OFF 被仿真 → 芯片没真的复位。请断开调试器。");
+    }
+    else if (p->latch == 0)
+    {
+        NRF_LOG_WARNING("  verdict   : LATCH 【不保留】—— 被唤醒复位清掉了。");
+        NRF_LOG_WARNING("              → 反推唤醒源只能靠开机读电平(分支 3 的做法),");
+        NRF_LOG_WARNING("                而脉冲信号会漏判。多唤醒脚需另想办法。");
+    }
+    else
+    {
+        NRF_LOG_INFO("  verdict   : LATCH 【保留】—— 可用于反推唤醒源。");
+        NRF_LOG_INFO("              → 上面 latch=1 的那个脚就是本次唤醒源,");
+        NRF_LOG_INFO("                且对短脉冲同样有效(粘滞位, 不依赖醒来时的电平)。");
+    }
+    NRF_LOG_FLUSH();
+
+    /* ---------------- 武装下一轮 ---------------- */
+    NRF_POWER->GPREGRET2 = p->round + 1;
+
+    for (uint8_t i = 0; i < PROBE_PIN_COUNT; i++)
+    {
+        uint8_t pin = m_probe_pins[i];
+
+        /* 两个脚都用上拉: P0.14 是 active-low 按键(与 drv_key.c 的 KEY_PULL_CFG
+         * 一致), P0.22 沿用 WAKE_PIN_PULL。
+         * ⚠ 上拉 + 外部持续拉低 = VDD/13kΩ ≈ 250µA 漏流, 会把 0.4µA 的深睡功耗
+         *   彻底废掉。实验期间无所谓, 但接进产品前必须按外部电路是开漏还是推挽
+         *   重新定这一项。 */
+        nrf_gpio_cfg_input(pin, NRF_GPIO_PIN_PULLUP);
+
+        /* ② 武装到与当前电平【相反】的方向。硬件不支持"任意边沿", 且若武装成
+         *    与当前电平相同的方向, 判据立刻满足 → 立刻 DETECT → 根本进不去 OFF。
+         *    做法与 rearm_and_off() 一致。 */
+        nrf_gpio_pin_sense_t sense = nrf_gpio_pin_read(pin)
+                                     ? NRF_GPIO_PIN_SENSE_LOW
+                                     : NRF_GPIO_PIN_SENSE_HIGH;
+        nrf_gpio_cfg_sense_set(pin, sense);
+    }
+
+    /* ③ 武装【之后】清 LATCH, 把武装动作自己造出来的 latch 一并清掉。
+     * 清全部而不是只清两个候选脚: 这样醒来打印的 LATCH 若非 0, 一定是本次休眠
+     * 期间发生的事, 结论无歧义。
+     * ⚠ 直接写寄存器是因为 nrf_gpio HAL 只有按脚清(nrf_gpio_pin_latch_clear),
+     *   没有"清全部"; 且 nRF52810 上必须用 NRF_P0(无 NRF_GPIO 符号)。 */
+    NRF_P0->LATCH = 0xFFFFFFFFUL;
+
+    /* ④ 回读自检。 */
+    uint32_t after = 0;
+    nrf_gpio_latches_read(0, 1, &after);
+
+    if (after != 0)
+    {
+        NRF_LOG_ERROR("  ARM CONFLICT: LATCH 清不掉 (0x%08x)。", after);
+        NRF_LOG_ERROR("               说明有脚的 SENSE 判据持续满足 → 本轮会立刻");
+        NRF_LOG_ERROR("               醒来, 数据作废。检查外部电平与上拉配置。");
+    }
+    else
+    {
+        NRF_LOG_INFO("  armed     : LATCH 已清零, %u 个脚的 SENSE 已武装到反向。",
+                     (uint32_t)PROBE_PIN_COUNT);
+        NRF_LOG_INFO("              进 System OFF, 等唤醒。");
+    }
+    NRF_LOG_FLUSH();
+
+    NRF_POWER->SYSTEMOFF = 1;
+    __DSB();
+
+    /* 走到这里只有一个原因: 调试器连着, System OFF 被仿真了。
+     * 下一轮的 RESETREAS.OFF 会是 0, 探针会明确报"这不是 System OFF 唤醒"。 */
+    for (;;)
+    {
+        __WFE();
+    }
+}
+
+#endif /* LATCH_PROBE_ENABLED */
 
 /* ==================================================================
  *  唤醒引脚 —— 运行态的边沿中断(联调用, 与 System OFF 的 SENSE 唤醒互补)
@@ -1457,14 +1680,27 @@ static void ble_start(void)
 
 int main(void)
 {
+#if LATCH_PROBE_ENABLED
+    /* ⚠ 必须是 main() 的第一批指令: 任何对 PIN_CNF 的写都可能改变 LATCH,
+     *   而 log_init() 就会去配 UART 的 P0.06。所以"快照"必须早于 log_init(),
+     *   "打印"只能晚于它 —— 这就是探针拆成两个函数的原因。 */
+    latch_probe_t probe_snap;
+    latch_probe_snapshot(&probe_snap);
+#endif
+
     log_init();
     {
         NRF_LOG_INFO("sensor_beacon boot.");
         // NRF_LOG_FLUSH();
     }
 
-#if 1
-    /* ===== HX711 测试: 定时读取两通道 ADC 数值并通过日志/串口打印 ===== */
+#if LATCH_PROBE_ENABLED
+    /* 不返回: 打印 → 武装 → System OFF。与下面分支 1 互斥。 */
+    latch_probe_run(&probe_snap);
+#endif
+
+#if !LATCH_PROBE_ENABLED
+    /* ===== 分支 1: HX711 定时读取两通道 + 按键/LED + BLE(默认静默) ===== */
 
     /* 1) 使能 BLE 协议栈 (提供 LFCLK 给 app_timer) */
     ble_stack_init();
