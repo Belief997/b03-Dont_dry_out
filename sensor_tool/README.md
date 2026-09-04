@@ -17,6 +17,9 @@ rust_builder/           ⚠ FRB/cargokit 生成的构建桥, 不要手改
 windows/runner/         Win32 宿主 (竖窗尺寸与最小尺寸在这里)
 ```
 
+**分层、依赖方向、全局单例、数据通路、测试分层、配色约定 → [ARCHITECTURE.md](ARCHITECTURE.md)。**
+本文只管构建步骤、踩过的坑与设备侧硬约束, 两边不重复写同一件事。
+
 ---
 
 ## 构建与运行
@@ -160,6 +163,7 @@ Windows debug 构建通过, `sensor_tool_core.dll` 随 exe 打包):
 - 命令协议 v1 帧层 + 多帧重组 + 单测(丢帧检测、回显误判、帧交织、字节预算自洽)
 - 适配器枚举、扫描、按 (device_id, counter) 的轮次去重
 - 竖窗 + 最小尺寸约束
+- 白底浅色主题(配色常量与禁用项见 ARCHITECTURE.md §7)
 
 **尚未做**:
 

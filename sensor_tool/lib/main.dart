@@ -23,6 +23,25 @@ Future<void> main() async {
   runApp(const SensorToolApp());
 }
 
+/// 白底下的文字/图标灰阶。
+///
+/// ⚠ 这一组常量是用来替换原先的 `Colors.white24/38/54/70` 的。那套值只在深色
+///   背景下成立 —— 换成白底后会变成"白字白底", 内容在界面上直接消失, 而且
+///   **不报任何错**(布局照旧、测试照过, 只是看不见)。所以本文件不要再出现
+///   `Colors.whiteNN`。
+const _muted = Color(0xFF5F6368); // 次要文字: RSSI、ID/电量行
+const _faint = Color(0xFF9AA0A6); // 三级文字: 通道名、增益标注
+const _ghost = Color(0xFFC4C7C5); // 空列表的大图标
+
+/// 语义色。
+///
+/// ⚠ 不用 `Colors.tealAccent / redAccent / orangeAccent` —— `*Accent` 系是配深色
+///   背景的高亮色, 白底上对比度不足(orangeAccent 在白底几乎看不清)。统一取
+///   同色系的深色档。
+const _ok = Color(0xFF00695C); // teal 800  适配器可用
+const _danger = Color(0xFFC62828); // red 800   适配器不可用
+const _warn = Color(0xFFB26A00); // amber 900 广播解析失败
+
 class SensorToolApp extends StatelessWidget {
   const SensorToolApp({super.key});
 
@@ -33,8 +52,15 @@ class SensorToolApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         colorSchemeSeed: Colors.teal,
-        brightness: Brightness.dark,
+        brightness: Brightness.light,
         useMaterial3: true,
+        // ⚠ 必须显式指定纯白: M3 的 light 主题默认拿带色调的 surface 当页面底色
+        //   (teal 种子下算出来是略偏青的灰白), 只把 brightness 翻成 light
+        //   得不到白背景。
+        scaffoldBackgroundColor: Colors.white,
+        // ⚠ Card 刻意【不】跟着设成纯白: 页面已经是纯白, 卡片再纯白就与背景糊
+        //   在一起, 只能靠阴影分辨。这里保持 M3 默认的 surfaceContainerLow
+        //   (带一点色调), 卡片边界才看得出来。
       ),
       home: const ScanPage(),
     );
@@ -184,7 +210,7 @@ class _AdapterCard extends StatelessWidget {
                 Icon(
                   error == null ? Icons.bluetooth : Icons.bluetooth_disabled,
                   size: 18,
-                  color: error == null ? Colors.tealAccent : Colors.redAccent,
+                  color: error == null ? _ok : _danger,
                 ),
                 const SizedBox(width: 8),
                 const Text('适配器',
@@ -197,7 +223,7 @@ class _AdapterCard extends StatelessWidget {
               const SizedBox(height: 6),
               Text(
                 error!,
-                style: const TextStyle(fontSize: 11, color: Colors.redAccent),
+                style: const TextStyle(fontSize: 11, color: _danger),
               ),
             ],
           ],
@@ -255,7 +281,7 @@ class _EmptyHint extends StatelessWidget {
             Icon(
               scanning ? Icons.sensors : Icons.sensors_off,
               size: 40,
-              color: Colors.white24,
+              color: _ghost,
             ),
             const SizedBox(height: 16),
             Text(
@@ -272,8 +298,7 @@ class _EmptyHint extends StatelessWidget {
                 '而设备一轮只持续 1.5 秒 —— 按一次可能一条都收不到, '
                 '多按几次是正常操作。可靠的数据采集要走连接后的记录下载。',
                 textAlign: TextAlign.center,
-                style: TextStyle(
-                    fontSize: 11, color: Colors.white54, height: 1.6),
+                style: TextStyle(fontSize: 11, color: _muted, height: 1.6),
               ),
           ],
         ),
@@ -292,13 +317,13 @@ class _AdvTile extends StatelessWidget {
     if (!ev.ok) {
       return ListTile(
         dense: true,
-        leading: const Icon(Icons.error_outline, color: Colors.orangeAccent),
+        leading: const Icon(Icons.error_outline, color: _warn),
         title:
             Text(ev.mac ?? '(未知 MAC)', style: const TextStyle(fontSize: 12)),
         subtitle: Text(
           // 解析失败也显示 —— 固件升级到新协议版本后, 这是唯一的线索。
           '解析失败: ${ev.error ?? "未知原因"}\n${_hex(ev.raw)}',
-          style: const TextStyle(fontSize: 11, color: Colors.orangeAccent),
+          style: const TextStyle(fontSize: 11, color: _warn),
         ),
       );
     }
@@ -322,14 +347,14 @@ class _AdvTile extends StatelessWidget {
               ),
               Text(
                 ev.rssi == null ? 'n/a' : '${ev.rssi} dBm',
-                style: const TextStyle(fontSize: 11, color: Colors.white54),
+                style: const TextStyle(fontSize: 11, color: _muted),
               ),
             ],
           ),
           const SizedBox(height: 4),
           Text(
             'ID 0x$idHex  #${ev.counter}  ${ev.battMv} mV  v0x$verHex',
-            style: const TextStyle(fontSize: 11, color: Colors.white70),
+            style: const TextStyle(fontSize: 11, color: _muted),
           ),
           const SizedBox(height: 4),
           // 增益标注直接写在界面上: 三通道灵敏度差 4 倍且载荷不带增益字段,
@@ -350,7 +375,7 @@ class _AdvTile extends StatelessWidget {
           SizedBox(
             width: 34,
             child: Text(name,
-                style: const TextStyle(fontSize: 11, color: Colors.white54)),
+                style: const TextStyle(fontSize: 11, color: _faint)),
           ),
           SizedBox(
             width: 90,
@@ -362,8 +387,7 @@ class _AdvTile extends StatelessWidget {
             ),
           ),
           const SizedBox(width: 10),
-          Text(gain,
-              style: const TextStyle(fontSize: 10, color: Colors.white38)),
+          Text(gain, style: const TextStyle(fontSize: 10, color: _faint)),
         ],
       ),
     );
