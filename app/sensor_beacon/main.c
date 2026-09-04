@@ -83,13 +83,13 @@
  *   做法见 rearm_and_off(): 读当前电平, 武装相反方向。 */
 #define WAKE_PIN                    22
 
-/* 唤醒引脚上拉/下拉: 使能内部上拉(RPU 典型 13kΩ, 数据手册 GPIO 电气规格)。
+/* 唤醒引脚上拉/下拉: 当前使能内部下拉(RPD 典型 13kΩ, 数据手册 GPIO 电气规格)。
  *
- * 选上拉而非 NOPULL: 外部若是开漏/集电极开路输出(比较器常见), 必须有上拉
- * 才能确定高电平; 且悬空输入在 System OFF 下会因电平漂移引起误唤醒。
- * 代价是被拉低期间有 VDD/13k ≈ 250µA 漏流 —— 若外部确认为推挽输出,
- * 可改 NRF_GPIO_PIN_NOPULL 省掉这笔。 */
-#define WAKE_PIN_PULL               NRF_GPIO_PIN_PULLUP
+ * 2026-09-04: 由 PULLUP 改为 PULLDOWN(按外部电路实测/确认后调整)。
+ * ⚠ 复核外部电路形式: 若为开漏/集电极开路输出, 悬空高必须靠【上拉】确定,
+ *   请改回 NRF_GPIO_PIN_PULLUP; 若为推挽输出则连下拉都可省, 用 NOPULL。
+ *   无论上/下拉, 与外部相反电平期间漏流 ≈ VDD/13k ≈ 250µA。 */
+#define WAKE_PIN_PULL               NRF_GPIO_PIN_PULLDOWN
 
 /* 电池电压 ADC 通道: 内部 VDD 输入,无需外部引脚 */
 #define SAADC_CH_BATTERY            1
@@ -660,27 +660,27 @@ static void latch_probe_run(const latch_probe_t * p)
     {
         /* 冷启动(上电/掉电复位会清 GPREGRET2)。这一轮 RESETREAS 里没有 OFF 位,
          * LATCH 也没有意义 —— 只负责武装然后睡下去。结论从第 1 轮开始看。 */
-        NRF_LOG_INFO("  verdict   : 冷启动, 本轮只武装。");
-        NRF_LOG_INFO("              请触发一次唤醒(按键 或 拉动 P0.%02u), 看下一轮。",
+        NRF_LOG_INFO("  verdict   : cold boot, this round only arms.  ");
+        NRF_LOG_INFO("              trigger a wake-up (button or drive P0.%02u), watch the next round.",
                      WAKE_PIN);
     }
     else if (!woke_from_off)
     {
-        NRF_LOG_WARNING("  verdict   : 本次【不是】System OFF 唤醒 (RESETREAS.OFF=0)。");
-        NRF_LOG_WARNING("              本轮数据无效。最常见原因: SWD 调试器还连着,");
-        NRF_LOG_WARNING("              System OFF 被仿真 → 芯片没真的复位。请断开调试器。");
+        NRF_LOG_WARNING("  verdict   : NOT a System OFF wake-up (RESETREAS.OFF=0).");
+        NRF_LOG_WARNING("              this round's data is invalid. Most likely the SWD debugger is");
+        NRF_LOG_WARNING("              still connected: System OFF is emulated, chip did not reset.");
     }
     else if (p->latch == 0)
     {
-        NRF_LOG_WARNING("  verdict   : LATCH 【不保留】—— 被唤醒复位清掉了。");
-        NRF_LOG_WARNING("              → 反推唤醒源只能靠开机读电平(分支 3 的做法),");
-        NRF_LOG_WARNING("                而脉冲信号会漏判。多唤醒脚需另想办法。");
+        NRF_LOG_WARNING("  verdict   : LATCH NOT retained - cleared by the wake-up reset.");
+        NRF_LOG_WARNING("              -> wake source can only be inferred from pin levels at boot");
+        NRF_LOG_WARNING("                 (branch 3), which misses short pulses. Need another scheme.");
     }
     else
     {
-        NRF_LOG_INFO("  verdict   : LATCH 【保留】—— 可用于反推唤醒源。");
-        NRF_LOG_INFO("              → 上面 latch=1 的那个脚就是本次唤醒源,");
-        NRF_LOG_INFO("                且对短脉冲同样有效(粘滞位, 不依赖醒来时的电平)。");
+        NRF_LOG_INFO("  verdict   : LATCH retained - usable for wake-source inference.");
+        NRF_LOG_INFO("              -> the pin with latch=1 above is this round's wake source;");
+        NRF_LOG_INFO("                 valid for short pulses too (sticky bit, level-independent at wake).");
     }
     NRF_LOG_FLUSH();
 
@@ -691,12 +691,15 @@ static void latch_probe_run(const latch_probe_t * p)
     {
         uint8_t pin = m_probe_pins[i];
 
-        /* 两个脚都用上拉: P0.14 是 active-low 按键(与 drv_key.c 的 KEY_PULL_CFG
-         * 一致), P0.22 沿用 WAKE_PIN_PULL。
-         * ⚠ 上拉 + 外部持续拉低 = VDD/13kΩ ≈ 250µA 漏流, 会把 0.4µA 的深睡功耗
-         *   彻底废掉。实验期间无所谓, 但接进产品前必须按外部电路是开漏还是推挽
-         *   重新定这一项。 */
-        nrf_gpio_cfg_input(pin, NRF_GPIO_PIN_PULLUP);
+        /* 每脚按各自的上/下拉: P0.14 是 active-low 按键, 必须保持上拉
+         * (与 drv_key.c 的 KEY_PULL_CFG 一致); P0.22 用 WAKE_PIN_PULL(当前下拉)。
+         * ⚠ 外部电平与内部电阻方向相反时漏流 ≈ VDD/13k ≈ 250µA, 会把 0.4µA
+         *   的深睡功耗彻底废掉。实验期间无所谓, 但接进产品前必须按外部电路是
+         *   开漏还是推挽重新定这一项。 */
+        nrf_gpio_pin_pull_t pull = (pin == WAKE_PIN)
+                                   ? WAKE_PIN_PULL
+                                   : NRF_GPIO_PIN_PULLUP;
+        nrf_gpio_cfg_input(pin, pull);
 
         /* ② 武装到与当前电平【相反】的方向。硬件不支持"任意边沿", 且若武装成
          *    与当前电平相同的方向, 判据立刻满足 → 立刻 DETECT → 根本进不去 OFF。
@@ -720,15 +723,15 @@ static void latch_probe_run(const latch_probe_t * p)
 
     if (after != 0)
     {
-        NRF_LOG_ERROR("  ARM CONFLICT: LATCH 清不掉 (0x%08x)。", after);
-        NRF_LOG_ERROR("               说明有脚的 SENSE 判据持续满足 → 本轮会立刻");
-        NRF_LOG_ERROR("               醒来, 数据作废。检查外部电平与上拉配置。");
+        NRF_LOG_ERROR("  ARM CONFLICT: LATCH cannot be cleared (0x%08x).", after);
+        NRF_LOG_ERROR("                some pin's SENSE condition is continuously met -> this round will");
+        NRF_LOG_ERROR("                wake immediately; data void. Check external levels & pull config.");
     }
     else
     {
-        NRF_LOG_INFO("  armed     : LATCH 已清零, %u 个脚的 SENSE 已武装到反向。",
+        NRF_LOG_INFO("  armed     : LATCH cleared, SENSE armed to opposite edge on %u pins.",
                      (uint32_t)PROBE_PIN_COUNT);
-        NRF_LOG_INFO("              进 System OFF, 等唤醒。");
+        NRF_LOG_INFO("              entering System OFF, waiting for wake-up.");
     }
     NRF_LOG_FLUSH();
 
