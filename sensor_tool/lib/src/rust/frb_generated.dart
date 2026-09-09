@@ -67,7 +67,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.13.0';
 
   @override
-  int get rustContentHash => -1764780113;
+  int get rustContentHash => -1007545650;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -79,7 +79,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
 }
 
 abstract class RustLibApi extends BaseApi {
-  String crateApiBleBleAdapterName();
+  BleAdapterStatus crateApiBleBleAdapterStatus();
 
   BleMode crateApiBleBleMode();
 
@@ -101,7 +101,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   });
 
   @override
-  String crateApiBleBleAdapterName() {
+  BleAdapterStatus crateApiBleBleAdapterStatus() {
     return handler.executeSync(
       SyncTask(
         callFfi: () {
@@ -109,18 +109,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 1)!;
         },
         codec: SseCodec(
-          decodeSuccessData: sse_decode_String,
-          decodeErrorData: sse_decode_AnyhowException,
+          decodeSuccessData: sse_decode_ble_adapter_status,
+          decodeErrorData: null,
         ),
-        constMeta: kCrateApiBleBleAdapterNameConstMeta,
+        constMeta: kCrateApiBleBleAdapterStatusConstMeta,
         argValues: [],
         apiImpl: this,
       ),
     );
   }
 
-  TaskConstMeta get kCrateApiBleBleAdapterNameConstMeta =>
-      const TaskConstMeta(debugName: "ble_adapter_name", argNames: []);
+  TaskConstMeta get kCrateApiBleBleAdapterStatusConstMeta =>
+      const TaskConstMeta(debugName: "ble_adapter_status", argNames: []);
 
   @override
   BleMode crateApiBleBleMode() {
@@ -269,6 +269,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  BleAdapterStatus dco_decode_ble_adapter_status(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return BleAdapterStatus.values[raw as int];
+  }
+
+  @protected
   BleAdvEvent dco_decode_ble_adv_event(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
@@ -374,6 +380,13 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var inner = sse_decode_list_prim_u_8_strict(deserializer);
     return utf8.decoder.convert(inner);
+  }
+
+  @protected
+  BleAdapterStatus sse_decode_ble_adapter_status(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var inner = sse_decode_i_32(deserializer);
+    return BleAdapterStatus.values[inner];
   }
 
   @protected
@@ -511,6 +524,15 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   void sse_encode_String(String self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_list_prim_u_8_strict(utf8.encoder.convert(self), serializer);
+  }
+
+  @protected
+  void sse_encode_ble_adapter_status(
+    BleAdapterStatus self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.index, serializer);
   }
 
   @protected

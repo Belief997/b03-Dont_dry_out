@@ -75,8 +75,14 @@ class ScanPage extends StatefulWidget {
 }
 
 class _ScanPageState extends State<ScanPage> {
-  String _adapter = '(未检测)';
-  String? _adapterError;
+  /// 蓝牙硬件状态。null = 还没探测过。
+  BleAdapterStatus? _adapter;
+
+  /// 探测本身抛异常时的原因。正常路径【不会】有 —— Rust 侧不返回 Result,
+  /// "没有适配器"是 BleAdapterStatus.absent 而不是异常。走到这里说明 Rust 侧
+  /// panic 了, 属于 bug。
+  String? _probeError;
+
   bool _scanning = false;
 
   /// 最近收到的广播, 最新的在前。
@@ -96,15 +102,15 @@ class _ScanPageState extends State<ScanPage> {
 
   void _probeAdapter() {
     try {
-      final name = bleAdapterName();
+      final s = bleAdapterStatus();
       setState(() {
-        _adapter = name;
-        _adapterError = null;
+        _adapter = s;
+        _probeError = null;
       });
     } catch (e) {
       setState(() {
-        _adapter = '(不可用)';
-        _adapterError = '$e';
+        _adapter = null;
+        _probeError = '$e';
       });
     }
   }
@@ -168,7 +174,7 @@ class _ScanPageState extends State<ScanPage> {
       ),
       body: Column(
         children: [
-          _AdapterCard(name: _adapter, error: _adapterError),
+          _AdapterCard(status: _adapter, error: _probeError),
           _ScanControl(
             scanning: _scanning,
             count: _events.length,
@@ -190,41 +196,103 @@ class _ScanPageState extends State<ScanPage> {
   }
 }
 
+/// 蓝牙硬件状态卡片。
+///
+/// ⚠ 刻意【不】显示适配器型号或名字。btleplug 在 Windows 上的 `adapter_info()`
+///   是硬编码返回 "WinRT" 的(其 winrtble 后端源码里写着
+///   `// TODO: Get information about the adapter.`), 显示出来看着像认出了硬件,
+///   实际什么都没说。
+///
+/// ⚠ 只报两条事实, 而且必须【分开】报: "有适配器但蓝牙关着"这种情况下扫描
+///   【不会报错】, 只是永远收不到东西 —— 而本工具的空列表本来就是正常状态
+///   (设备平时静默), 两者叠加就完全分辨不出是"没按按键"还是"蓝牙没开"。
+///   把这两条摊开是唯一能让人自己排掉这个误判的办法。
 class _AdapterCard extends StatelessWidget {
-  const _AdapterCard({required this.name, this.error});
+  const _AdapterCard({required this.status, this.error});
 
-  final String name;
+  /// null = 还没探测过(或探测抛异常, 见 error)。
+  final BleAdapterStatus? status;
   final String? error;
 
   @override
   Widget build(BuildContext context) {
+    final String hasAdapter;   // 是否配备蓝牙适配器
+    final String power;        // 蓝牙是否打开
+    final Color tone;
+    final IconData icon;
+    String? hint;
+
+    if (error != null) {
+      hasAdapter = '探测失败';
+      power = '—';
+      tone = _danger;
+      icon = Icons.error_outline;
+    } else if (status == null) {
+      hasAdapter = '(未检测)';
+      power = '—';
+      tone = _faint;
+      icon = Icons.bluetooth_searching;
+    } else if (status == BleAdapterStatus.absent) {
+      hasAdapter = '无';
+      power = '—';
+      tone = _danger;
+      icon = Icons.bluetooth_disabled;
+    } else if (status == BleAdapterStatus.poweredOff) {
+      hasAdapter = '有';
+      power = '未打开';
+      tone = _warn;
+      icon = Icons.bluetooth_disabled;
+      // 这是唯一"看起来能用但一定收不到"的状态, 必须明说。
+      hint = '蓝牙关着时扫描不报错, 只是永远收不到数据。请先在系统里打开蓝牙。';
+    } else if (status == BleAdapterStatus.ready) {
+      hasAdapter = '有';
+      power = '已打开';
+      tone = _ok;
+      icon = Icons.bluetooth;
+    } else {
+      hasAdapter = '有';
+      power = '未知';
+      tone = _warn;
+      icon = Icons.bluetooth;
+      hint = '读不到蓝牙开关状态。可以照常扫描, 收不到数据时先确认系统蓝牙已打开。';
+    }
+
+    // 两条事实压成一行。竖窗只有 480 逻辑像素宽却要放长列表, 顶部每多占一行
+    // 就少看一条广播 —— 而这张卡在正常情况下(有适配器 + 蓝牙开着)是【不需要
+    // 被读】的, 只有异常时才值得占地方。所以正常态一行, 异常态才追加提示行。
+    const label = TextStyle(fontSize: 12, color: _muted);
+    final value = TextStyle(
+        fontSize: 12, color: tone, fontWeight: FontWeight.w600);
+
     return Card(
-      margin: const EdgeInsets.all(8),
+      margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
       child: Padding(
-        padding: const EdgeInsets.all(12),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Row(
               children: [
-                Icon(
-                  error == null ? Icons.bluetooth : Icons.bluetooth_disabled,
-                  size: 18,
-                  color: error == null ? _ok : _danger,
-                ),
+                Icon(icon, size: 16, color: tone),
                 const SizedBox(width: 8),
-                const Text('适配器',
-                    style: TextStyle(fontWeight: FontWeight.bold)),
+                Text.rich(TextSpan(children: [
+                  const TextSpan(text: '适配器 ', style: label),
+                  TextSpan(text: hasAdapter, style: value),
+                  const TextSpan(text: '    蓝牙 ', style: label),
+                  TextSpan(text: power, style: value),
+                ])),
               ],
             ),
-            const SizedBox(height: 6),
-            Text(name, style: const TextStyle(fontSize: 12)),
+            // 提示只在异常态出现, 所以它不算"不必要的留空"。
+            if (hint != null) ...[
+              const SizedBox(height: 6),
+              Text(hint,
+                  style: TextStyle(fontSize: 11, color: tone, height: 1.35)),
+            ],
             if (error != null) ...[
               const SizedBox(height: 6),
-              Text(
-                error!,
-                style: const TextStyle(fontSize: 11, color: _danger),
-              ),
+              Text(error!,
+                  style: const TextStyle(fontSize: 11, color: _danger)),
             ],
           ],
         ),

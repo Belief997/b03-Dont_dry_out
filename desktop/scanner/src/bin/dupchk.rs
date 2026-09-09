@@ -14,9 +14,8 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
-use btleplug::api::{Central, CentralEvent, Manager as _, ScanFilter};
-use btleplug::platform::Manager;
+use anyhow::{Context, Result};
+use btleplug::api::{Central, CentralEvent, ScanFilter};
 use tokio_stream::StreamExt;
 
 struct Track {
@@ -38,13 +37,7 @@ async fn main() -> Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(30);
 
-    let manager = Manager::new().await.context("failed to create the Bluetooth manager")?;
-    let adapters = manager.adapters().await.context("failed to enumerate adapters")?;
-    if adapters.is_empty() {
-        bail!("no Bluetooth adapter found");
-    }
-    let central = adapters.into_iter().next().unwrap();
-    println!("adapter: {}", central.adapter_info().await?);
+    let central = sensor_beacon_scanner::open_adapter().await?;
     println!("For {}s: are identical adverts still reported packet by packet, and what is the arrival gap distribution", secs);
     println!();
 

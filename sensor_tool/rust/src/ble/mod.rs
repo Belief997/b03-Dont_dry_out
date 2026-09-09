@@ -42,7 +42,9 @@ use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 
 use anyhow::{anyhow, Context, Result};
-use btleplug::api::{BDAddr, Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter};
+use btleplug::api::{
+    BDAddr, Central, CentralEvent, CentralState, Manager as _, Peripheral as _, ScanFilter,
+};
 use btleplug::platform::{Adapter, Manager, PeripheralId};
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
@@ -153,12 +155,71 @@ async fn adapter() -> Result<&'static Adapter> {
         .await
 }
 
-/// 适配器名字, 供 UI 显示。
-pub fn adapter_name() -> Result<String> {
+/// 关于本机蓝牙硬件, 我们真正能问出来的事。
+///
+/// ⚠ 刻意【不】报"具体是哪个适配器"。btleplug 在 Windows 上的 `adapter_info()`
+///   是硬编码返回 "WinRT" 的 —— winrtble 后端源码里就写着
+///   `// TODO: Get information about the adapter.` —— 显示出来看着像信息, 实际
+///   什么都没说, 反而让人以为工具认出了硬件。
+///
+/// 而"扫描收不到东西"时真正有用的两件事是可以分开判断的, 因为
+/// `Manager::adapters()` 枚举的是 `Radio::GetRadiosAsync()` 过滤
+/// `RadioKind::Bluetooth`, 蓝牙关着的 radio 一样会被列出来:
+///
+///     列表为空            -> 根本没有适配器
+///     列出 + PoweredOn    -> 可以扫
+///     列出 + PoweredOff   -> 硬件在, 但蓝牙被关掉了
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdapterStatus {
+    /// 没有蓝牙适配器。
+    Absent,
+    /// 有适配器, 但蓝牙是关的。
+    PoweredOff,
+    /// 有适配器且蓝牙已打开。
+    Ready,
+    /// 有适配器, 但 radio 状态读不出来(非 Windows 后端可能如此)。
+    Unknown,
+}
+
+/// 探测蓝牙硬件状态。不返回 Result —— "没有适配器"是一种正常状态而不是错误,
+/// 用 Err 表达会逼 UI 去解析错误字符串才能区分"没硬件"和"调用失败"。
+pub fn adapter_status() -> AdapterStatus {
     RT.block_on(async {
-        let a = adapter().await?;
-        a.adapter_info().await.context("failed to read adapter info")
+        // 快路径: 适配器已缓存, 直接读 radio 状态。缓存的 Adapter 持有 WinRT 的
+        // Radio 句柄, adapter_state() 每次都实时读它 —— 所以用户开关蓝牙不需要
+        // 重新枚举也能看到变化。
+        if let Some(a) = ADAPTER.get() {
+            return classify(a).await;
+        }
+
+        // 慢路径: 还没缓存过。这里必须自己枚举而不是调 adapter() ——
+        // 后者把"列表为空"和"调用失败"都塌成一个 Err, 分不出 Absent 与 Unknown。
+        let Ok(manager) = Manager::new().await else {
+            return AdapterStatus::Unknown;
+        };
+        let Ok(list) = manager.adapters().await else {
+            return AdapterStatus::Unknown;
+        };
+        let Some(a) = list.into_iter().next() else {
+            return AdapterStatus::Absent;
+        };
+
+        // 顺手把它塞进缓存, 下次走快路径。set() 失败说明有并发的 scan_start
+        // 抢先填了 —— 两个 adapter 等价, 忽略即可。
+        let _ = ADAPTER.set(a);
+        match ADAPTER.get() {
+            Some(a) => classify(a).await,
+            None => AdapterStatus::Unknown,
+        }
     })
+}
+
+async fn classify(a: &Adapter) -> AdapterStatus {
+    match a.adapter_state().await {
+        Ok(CentralState::PoweredOn) => AdapterStatus::Ready,
+        Ok(CentralState::PoweredOff) => AdapterStatus::PoweredOff,
+        _ => AdapterStatus::Unknown,
+    }
 }
 
 pub fn mode() -> Mode {

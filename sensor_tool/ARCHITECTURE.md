@@ -144,7 +144,7 @@
 SensorToolApp (MaterialApp, 主题在这里)
 └── ScanPage / _ScanPageState        ← 全部可变状态: _adapter, _adapterError,
     │                                  _scanning, _events(上限 200)
-    ├── _AdapterCard   适配器名 / 错误
+    ├── _AdapterCard   有无适配器 / 蓝牙开没开（⚠ 刻意不显示适配器型号，见下）
     ├── _ScanControl   开始·停止 + 轮数
     ├── _EmptyHint     ⚠ "设备平时静默"提示 —— 有测试钉住, 别删
     └── _AdvTile       一轮广播; 解析失败走另一分支
@@ -181,7 +181,7 @@ SensorToolApp (MaterialApp, 主题在这里)
 |---|---|---:|---|---|
 | Rust 单测 | `cd rust && cargo test` | **22** | 协议编解码全部（`adv` 6 + `cmd` 13）+ `ble` 的纯逻辑部分（去重/初始态 3） | 不需要设备，也不需要蓝牙 |
 | Dart widget | `flutter test` | 1 | 不依赖 Rust 的展示型 widget | ⚠ `RustLib.init()` 需要真 native 库，`flutter_test` 环境里没有 → **不能构造 `SensorToolApp`**（它的 `initState` 会调 `bleAdapterName()`） |
-| 集成 | `flutter test integration_test/simple_test.dart -d windows` | 3 | FRB 桥连通、`Mode` 起始为 Idle、适配器可枚举 | 要真 Windows 设备 + 蓝牙 |
+| 集成 | `flutter test integration_test/simple_test.dart -d windows` | 3 | FRB 桥连通、`Mode` 起始为 Idle、蓝牙硬件状态可读 | 要真 Windows 设备 + 蓝牙 |
 
 ⚠ **不要在集成测试里测"能不能扫到设备"**：设备平时完全静默，且 Windows 收包率天然很低。那属于需要真硬件在场的手工验证。
 
@@ -189,7 +189,9 @@ SensorToolApp (MaterialApp, 主题在这里)
 
 ## 9. 当前能力边界
 
-**已通**：FRB 桥、广播 v0x02 解析、命令 v1 帧层与重组、适配器枚举与扫描、轮次去重、竖窗约束、白底主题。
+**已通**：FRB 桥、广播 v0x02 解析、命令 v1 帧层与重组、蓝牙硬件状态探测与扫描、轮次去重、竖窗约束、白底主题。
+
+⚠ **为什么不显示适配器型号**（`_AdapterCard` / scanner CLI 都是这个取舍）：btleplug 在 Windows 上的 `adapter_info()` 硬编码返回 `"WinRT"`，其 winrtble 后端源码里就写着 `// TODO: Get information about the adapter.`，显示出来是假信息。改报两条**分开**的事实：有无适配器（`Manager::adapters()` 是否为空）+ 蓝牙开没开（`adapter_state()` → `CentralState`）。两条必须分开，因为 `adapters()` 枚举的是 `Radio::GetRadiosAsync()`，**蓝牙关着的 radio 一样会被列出来**；而"有适配器但蓝牙关着"时扫描**不报错**只是永远收不到东西 —— 叠上"设备平时静默、空列表是正常状态"这条，就完全分辨不出是没按按键还是蓝牙没开。
 
 **未通**：
 

@@ -6,10 +6,14 @@
 import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_fields_are_eq`, `clone`, `clone`, `eq`, `fmt`, `fmt`, `from`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `assert_fields_are_eq`, `assert_fields_are_eq`, `clone`, `clone`, `clone`, `eq`, `eq`, `fmt`, `fmt`, `fmt`, `from`, `from`
 
-/// 适配器名字。没有适配器时抛异常。
-String bleAdapterName() => RustLib.instance.api.crateApiBleBleAdapterName();
+/// 探测蓝牙硬件状态。
+///
+/// 不抛异常 —— "没有适配器"是一种正常状态而不是错误, 用异常表达会逼 UI 去解析
+/// 错误文本才能区分"没硬件"与"调用失败"。
+BleAdapterStatus bleAdapterStatus() =>
+    RustLib.instance.api.crateApiBleBleAdapterStatus();
 
 /// 当前适配器占用状态。
 BleMode bleMode() => RustLib.instance.api.crateApiBleBleMode();
@@ -28,6 +32,25 @@ Stream<BleAdvEvent> bleScanStart() =>
 
 /// 停止扫描。未在扫描时安全。
 void bleScanStop() => RustLib.instance.api.crateApiBleBleScanStop();
+
+/// 本机蓝牙硬件状态。与 [`ble::AdapterStatus`] 一一对应。
+///
+/// ⚠ 刻意只有"有没有适配器 / 蓝牙开没开"这两条, 【没有】适配器型号或名字 ——
+///   btleplug 在 Windows 上的 `adapter_info()` 是硬编码的 "WinRT"(其 winrtble
+///   后端写着 `// TODO`), 显示出来是假信息。详见 `ble::AdapterStatus` 的说明。
+enum BleAdapterStatus {
+  /// 本机没有蓝牙适配器。
+  absent,
+
+  /// 有适配器, 但蓝牙关着 —— 扫描不会报错, 只是永远收不到东西。
+  poweredOff,
+
+  /// 有适配器且蓝牙已打开, 可以扫描。
+  ready,
+
+  /// 有适配器, 但状态读不出来。
+  unknown,
+}
 
 /// 一条已解析的广播(去重后, 每轮 burst 只上报一条)。
 class BleAdvEvent {

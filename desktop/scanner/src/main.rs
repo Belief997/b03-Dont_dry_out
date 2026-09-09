@@ -76,9 +76,9 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
-use btleplug::api::{BDAddr, Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter};
-use btleplug::platform::{Adapter, Manager, PeripheralId};
+use anyhow::{Context, Result};
+use btleplug::api::{BDAddr, Central, CentralEvent, Peripheral as _, ScanFilter};
+use btleplug::platform::{Adapter, PeripheralId};
 use tokio_stream::StreamExt;
 
 /* ---------- 协议常量(与固件保持一致) ---------- */
@@ -278,15 +278,9 @@ async fn main() -> Result<()> {
     let (expect_events, verbose) = parse_args();
     let expect_packets = expect_events * CHANNELS_PER_EVENT;
 
-    let manager = Manager::new().await.context("failed to create the Bluetooth manager")?;
-    let adapters = manager.adapters().await.context("failed to enumerate Bluetooth adapters")?;
-    if adapters.is_empty() {
-        bail!("no Bluetooth adapter found");
-    }
-
-    let central = adapters.into_iter().next().unwrap();
-    let info = central.adapter_info().await.context("failed to read adapter info")?;
-    println!("adapter: {}", info);
+    /* 打印"有无适配器 + 蓝牙开没开", 而不是适配器型号 —— 理由见 lib.rs 的
+     * AdapterStatus。蓝牙关着时这里会直接报错退出, 免得跑完一轮却一条都收不到。 */
+    let central = sensor_beacon_scanner::open_adapter().await?;
     println!(
         "filter: Company ID 0x{:04X}, magic 0x{:02X}, version 0x{:02X}",
         COMPANY_ID, MAGIC, VERSION

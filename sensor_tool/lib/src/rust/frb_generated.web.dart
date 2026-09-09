@@ -33,6 +33,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   String dco_decode_String(dynamic raw);
 
   @protected
+  BleAdapterStatus dco_decode_ble_adapter_status(dynamic raw);
+
+  @protected
   BleAdvEvent dco_decode_ble_adv_event(dynamic raw);
 
   @protected
@@ -78,6 +81,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   String sse_decode_String(SseDeserializer deserializer);
+
+  @protected
+  BleAdapterStatus sse_decode_ble_adapter_status(SseDeserializer deserializer);
 
   @protected
   BleAdvEvent sse_decode_ble_adv_event(SseDeserializer deserializer);
@@ -129,6 +135,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_String(String self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_ble_adapter_status(
+    BleAdapterStatus self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_ble_adv_event(BleAdvEvent self, SseSerializer serializer);

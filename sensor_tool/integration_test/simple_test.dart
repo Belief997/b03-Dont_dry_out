@@ -26,21 +26,18 @@ void main() {
     expect(bleMode(), BleMode.idle);
   });
 
-  test('能枚举蓝牙适配器(本机需开启蓝牙)', () {
-    // 没有适配器时 Rust 侧抛异常 —— 那是环境问题而非代码问题, 所以这里
-    // 把两种结果都算通过, 只要不是别的异常。
+  test('能读到蓝牙硬件状态', () {
+    // 旧版这里要 try/catch —— bleAdapterName() 在没有适配器时抛异常, 得把异常
+    // 也算成通过。新 API 不抛了: "没有适配器"是 absent 这个正常返回值, 所以
+    // 这条测试简单了一截。
     //
-    // ⚠ 正因为两种结果都算通过, 必须把实际走的分支打出来 —— 否则"测试通过"
-    //   无法区分"真的枚举到了适配器"与"这台机器没蓝牙, 走了容错分支"。
-    try {
-      final name = bleAdapterName();
-      // ignore: avoid_print
-      print('[适配器] 枚举成功: $name');
-      expect(name, isNotEmpty);
-    } catch (e) {
-      // ignore: avoid_print
-      print('[适配器] 枚举失败(本机可能未开蓝牙): $e');
-      expect('$e', contains('适配器'));
-    }
+    // ⚠ 断言故意很弱: 本机有没有蓝牙、开没开都是【环境】问题, 不该让测试红。
+    //   这条真正验证的只是"这个 FFI 调用能跑通并返回一个合法枚举值"。
+    // ⚠ 也正因为断言弱, 必须把实际状态打出来 —— 否则"测试通过"无法区分
+    //   "真读到 ready" 与 "这台机器没蓝牙, 读到 absent"。
+    final s = bleAdapterStatus();
+    // ignore: avoid_print
+    print('[蓝牙] 状态 = $s');
+    expect(s, isA<BleAdapterStatus>());
   });
 }

@@ -39,7 +39,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.13.0";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -1764780113;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -1007545650;
 
 // Section: executor
 
@@ -47,14 +47,14 @@ flutter_rust_bridge::frb_generated_default_handler!();
 
 // Section: wire_funcs
 
-fn wire__crate__api__ble__ble_adapter_name_impl(
+fn wire__crate__api__ble__ble_adapter_status_impl(
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
     rust_vec_len_: i32,
     data_len_: i32,
 ) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
     FLUTTER_RUST_BRIDGE_HANDLER.wrap_sync::<flutter_rust_bridge::for_generated::SseCodec, _>(
         flutter_rust_bridge::for_generated::TaskInfo {
-            debug_name: "ble_adapter_name",
+            debug_name: "ble_adapter_status",
             port: None,
             mode: flutter_rust_bridge::for_generated::FfiCallMode::Sync,
         },
@@ -69,12 +69,10 @@ fn wire__crate__api__ble__ble_adapter_name_impl(
             let mut deserializer =
                 flutter_rust_bridge::for_generated::SseDeserializer::new(message);
             deserializer.end();
-            transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
-                (move || {
-                    let output_ok = crate::api::ble::ble_adapter_name()?;
-                    std::result::Result::Ok(output_ok)
-                })(),
-            )
+            transform_result_sse::<_, ()>((move || {
+                let output_ok = Ok::<_, ()>(crate::api::ble::ble_adapter_status())?;
+                std::result::Result::Ok(output_ok)
+            })())
         },
     )
 }
@@ -269,6 +267,20 @@ impl SseDecode for String {
     }
 }
 
+impl SseDecode for crate::api::ble::BleAdapterStatus {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut inner = <i32>::sse_decode(deserializer);
+        return match inner {
+            0 => crate::api::ble::BleAdapterStatus::Absent,
+            1 => crate::api::ble::BleAdapterStatus::PoweredOff,
+            2 => crate::api::ble::BleAdapterStatus::Ready,
+            3 => crate::api::ble::BleAdapterStatus::Unknown,
+            _ => unreachable!("Invalid variant for BleAdapterStatus: {}", inner),
+        };
+    }
+}
+
 impl SseDecode for crate::api::ble::BleAdvEvent {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -412,7 +424,7 @@ fn pde_ffi_dispatcher_sync_impl(
 ) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
     // Codec=Pde (Serialization + dispatch), see doc to use other codecs
     match func_id {
-        1 => wire__crate__api__ble__ble_adapter_name_impl(ptr, rust_vec_len, data_len),
+        1 => wire__crate__api__ble__ble_adapter_status_impl(ptr, rust_vec_len, data_len),
         2 => wire__crate__api__ble__ble_mode_impl(ptr, rust_vec_len, data_len),
         4 => wire__crate__api__ble__ble_scan_stop_impl(ptr, rust_vec_len, data_len),
         5 => wire__crate__api__simple__greet_impl(ptr, rust_vec_len, data_len),
@@ -422,6 +434,29 @@ fn pde_ffi_dispatcher_sync_impl(
 
 // Section: rust2dart
 
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::ble::BleAdapterStatus {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        match self {
+            Self::Absent => 0.into_dart(),
+            Self::PoweredOff => 1.into_dart(),
+            Self::Ready => 2.into_dart(),
+            Self::Unknown => 3.into_dart(),
+            _ => unreachable!(),
+        }
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
+    for crate::api::ble::BleAdapterStatus
+{
+}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::ble::BleAdapterStatus>
+    for crate::api::ble::BleAdapterStatus
+{
+    fn into_into_dart(self) -> crate::api::ble::BleAdapterStatus {
+        self
+    }
+}
 // Codec=Dco (DartCObject based), see doc to use other codecs
 impl flutter_rust_bridge::IntoDart for crate::api::ble::BleAdvEvent {
     fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
@@ -486,6 +521,24 @@ impl SseEncode for String {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
         <Vec<u8>>::sse_encode(self.into_bytes(), serializer);
+    }
+}
+
+impl SseEncode for crate::api::ble::BleAdapterStatus {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <i32>::sse_encode(
+            match self {
+                crate::api::ble::BleAdapterStatus::Absent => 0,
+                crate::api::ble::BleAdapterStatus::PoweredOff => 1,
+                crate::api::ble::BleAdapterStatus::Ready => 2,
+                crate::api::ble::BleAdapterStatus::Unknown => 3,
+                _ => {
+                    unimplemented!("");
+                }
+            },
+            serializer,
+        );
     }
 }
 

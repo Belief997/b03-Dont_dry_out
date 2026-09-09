@@ -74,10 +74,41 @@ pub struct BleAdvEvent {
 ///   而设备的 counter 不会重置 —— 重启扫描后第一包会被误判成"重复"而丢掉。
 static DEDUP: Mutex<Option<ble::RoundDedup>> = Mutex::new(None);
 
-/// 适配器名字。没有适配器时抛异常。
+/// 本机蓝牙硬件状态。与 [`ble::AdapterStatus`] 一一对应。
+///
+/// ⚠ 刻意只有"有没有适配器 / 蓝牙开没开"这两条, 【没有】适配器型号或名字 ——
+///   btleplug 在 Windows 上的 `adapter_info()` 是硬编码的 "WinRT"(其 winrtble
+///   后端写着 `// TODO`), 显示出来是假信息。详见 `ble::AdapterStatus` 的说明。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BleAdapterStatus {
+    /// 本机没有蓝牙适配器。
+    Absent,
+    /// 有适配器, 但蓝牙关着 —— 扫描不会报错, 只是永远收不到东西。
+    PoweredOff,
+    /// 有适配器且蓝牙已打开, 可以扫描。
+    Ready,
+    /// 有适配器, 但状态读不出来。
+    Unknown,
+}
+
+impl From<ble::AdapterStatus> for BleAdapterStatus {
+    fn from(s: ble::AdapterStatus) -> Self {
+        match s {
+            ble::AdapterStatus::Absent => Self::Absent,
+            ble::AdapterStatus::PoweredOff => Self::PoweredOff,
+            ble::AdapterStatus::Ready => Self::Ready,
+            ble::AdapterStatus::Unknown => Self::Unknown,
+        }
+    }
+}
+
+/// 探测蓝牙硬件状态。
+///
+/// 不抛异常 —— "没有适配器"是一种正常状态而不是错误, 用异常表达会逼 UI 去解析
+/// 错误文本才能区分"没硬件"与"调用失败"。
 #[frb(sync)]
-pub fn ble_adapter_name() -> anyhow::Result<String> {
-    ble::adapter_name()
+pub fn ble_adapter_status() -> BleAdapterStatus {
+    ble::adapter_status().into()
 }
 
 /// 当前适配器占用状态。

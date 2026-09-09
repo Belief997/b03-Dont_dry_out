@@ -161,7 +161,7 @@ Windows debug 构建通过, `sensor_tool_core.dll` 随 exe 打包):
 - 广播协议 v0x02 解析 + 单测(24bit 符号扩展边界、v3 明确拒绝而非误解、
   别人的 0xFFFF 包被正确过滤)
 - 命令协议 v1 帧层 + 多帧重组 + 单测(丢帧检测、回显误判、帧交织、字节预算自洽)
-- 适配器枚举、扫描、按 (device_id, counter) 的轮次去重
+- 蓝牙硬件状态探测(有无适配器 / 蓝牙开没开)、扫描、按 (device_id, counter) 的轮次去重
 - 竖窗 + 最小尺寸约束
 - 白底浅色主题(配色常量与禁用项见 ARCHITECTURE.md §7)
 

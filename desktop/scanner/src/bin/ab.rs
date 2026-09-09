@@ -24,9 +24,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
-use btleplug::api::{Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter};
-use btleplug::platform::Manager;
+use anyhow::{Context, Result};
+use btleplug::api::{Central, CentralEvent, Peripheral as _, ScanFilter};
 use tokio_stream::StreamExt;
 
 #[tokio::main]
@@ -36,13 +35,7 @@ async fn main() -> Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(20);
 
-    let manager = Manager::new().await.context("failed to create the Bluetooth manager")?;
-    let adapters = manager.adapters().await.context("failed to enumerate adapters")?;
-    if adapters.is_empty() {
-        bail!("no Bluetooth adapter found");
-    }
-    let central = Arc::new(adapters.into_iter().next().unwrap());
-    println!("adapter: {}", central.adapter_info().await?);
+    let central = Arc::new(sensor_beacon_scanner::open_adapter().await?);
     println!("A/B for {}s: fast (non-blocking) vs slow (queries peripheral props on every event)", secs);
     println!("Both sides subscribe to the same event source, so they see exactly the same packets on air.");
     println!();
