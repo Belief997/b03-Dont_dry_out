@@ -137,18 +137,18 @@ impl Status {
 impl std::fmt::Display for Status {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
-            Self::Ok => "成功",
-            Self::UnknownCmd => "命令码未定义",
-            Self::BadLength => "请求帧长度不符",
-            Self::BadParam => "参数越界",
-            Self::WrongMode => "标定模式状态不符",
-            Self::Busy => "设备忙(上一条未发完或 flash 操作中)",
-            Self::NotFound => "记录索引越界",
-            Self::Storage => "flash 读写失败",
-            Self::NotCalibrated => "设备未标定",
-            Self::Confirm => "确认码不对",
-            Self::Internal => "设备内部错误",
-            Self::Unknown(_) => "未知状态码",
+            Self::Ok => "ok",
+            Self::UnknownCmd => "undefined command code",
+            Self::BadLength => "request frame length mismatch",
+            Self::BadParam => "parameter out of range",
+            Self::WrongMode => "wrong calibration-mode state",
+            Self::Busy => "device busy (previous response still sending, or flash op in progress)",
+            Self::NotFound => "record index out of range",
+            Self::Storage => "flash read/write failed",
+            Self::NotCalibrated => "device not calibrated",
+            Self::Confirm => "wrong confirmation code",
+            Self::Internal => "device internal error",
+            Self::Unknown(_) => "unknown status code",
         };
         match self {
             Self::Unknown(v) => write!(f, "{s}(0x{v:02X})"),
@@ -371,24 +371,24 @@ pub enum CodecError {
 impl std::fmt::Display for CodecError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ArgsTooLong { got, max } => write!(f, "参数 {got} 字节, 上限 {max}"),
-            Self::ReservedTag => write!(f, "TAG 0xFF 是设备主动上报的保留值"),
+            Self::ArgsTooLong { got, max } => write!(f, "args are {got} bytes, limit is {max}"),
+            Self::ReservedTag => write!(f, "TAG 0xFF is reserved for device-initiated reports"),
             Self::FrameTooShort { got } => {
-                write!(f, "响应帧只有 {got} 字节, 至少需要 {RESP_HDR_LEN}")
+                write!(f, "response frame is only {got} bytes, needs at least {RESP_HDR_LEN}")
             }
-            Self::FrameTooLong { got } => write!(f, "响应帧 {got} 字节, 上限 {MAX_FRAME}"),
+            Self::FrameTooLong { got } => write!(f, "response frame is {got} bytes, limit is {MAX_FRAME}"),
             Self::NotAResponse { got } => {
-                write!(f, "首字节 0x{got:02X} 未置响应位(固件可能仍是回显实现)")
+                write!(f, "first byte 0x{got:02X} has no response bit set (firmware may still be the echo stub)")
             }
             Self::UnexpectedSeq { want, got } => {
-                write!(f, "帧号错乱: 期望 {want}, 收到 {got}(可能丢帧)")
+                write!(f, "frame sequence broken: expected {want}, got {got} (a frame may be lost)")
             }
             Self::ShortNonFinalFrame { got } => {
-                write!(f, "非末帧只有 {got} 字节数据, 应满 {DATA_MAX}(可能丢帧)")
+                write!(f, "non-final frame carries only {got} data bytes, expected a full {DATA_MAX} (a frame may be lost)")
             }
-            Self::FrameMismatch => write!(f, "帧的 cmd/tag 与当前重组轮次不符"),
-            Self::ResponseTooLong => write!(f, "响应超过 {RESP_DATA_MAX} 字节上限"),
-            Self::TooManyFrames => write!(f, "响应超过 {FRAMES_MAX} 帧上限"),
+            Self::FrameMismatch => write!(f, "frame cmd/tag does not match the current reassembly round"),
+            Self::ResponseTooLong => write!(f, "response exceeds the {RESP_DATA_MAX} byte limit"),
+            Self::TooManyFrames => write!(f, "response exceeds the {FRAMES_MAX} frame limit"),
         }
     }
 }
@@ -512,7 +512,7 @@ mod tests {
                 assert_eq!(status, Status::Confirm);
                 assert!(data.is_empty());
             }
-            Assembled::Pending => panic!("失败响应必须是单帧"),
+            Assembled::Pending => panic!("an error response must be a single frame"),
         }
     }
 

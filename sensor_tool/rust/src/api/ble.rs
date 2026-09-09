@@ -97,7 +97,7 @@ pub fn ble_mode() -> BleMode {
 ///   连接后的 `REC_READ`, 不要指望扫描收全。
 pub fn ble_scan_start(sink: StreamSink<BleAdvEvent>) -> anyhow::Result<()> {
     {
-        let mut d = DEDUP.lock().expect("DEDUP 被 poison");
+        let mut d = DEDUP.lock().expect("DEDUP mutex poisoned");
         if d.is_none() {
             *d = Some(ble::RoundDedup::default());
         }
@@ -108,7 +108,7 @@ pub fn ble_scan_start(sink: StreamSink<BleAdvEvent>) -> anyhow::Result<()> {
             Some(p) => {
                 // 去重: 同一轮 burst 的重复包直接丢, 不过 FFI。
                 {
-                    let mut guard = DEDUP.lock().expect("DEDUP 被 poison");
+                    let mut guard = DEDUP.lock().expect("DEDUP mutex poisoned");
                     let d = guard.get_or_insert_with(ble::RoundDedup::default);
                     if !d.is_new_round(p.device_id, p.counter) {
                         return;

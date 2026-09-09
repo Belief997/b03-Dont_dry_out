@@ -36,22 +36,22 @@ async fn main() -> Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(20);
 
-    let manager = Manager::new().await.context("创建蓝牙管理器失败")?;
-    let adapters = manager.adapters().await.context("枚举适配器失败")?;
+    let manager = Manager::new().await.context("failed to create the Bluetooth manager")?;
+    let adapters = manager.adapters().await.context("failed to enumerate adapters")?;
     if adapters.is_empty() {
-        bail!("未找到蓝牙适配器");
+        bail!("no Bluetooth adapter found");
     }
     let central = Arc::new(adapters.into_iter().next().unwrap());
-    println!("适配器: {}", central.adapter_info().await?);
-    println!("A/B 对比 {} 秒: fast(不阻塞) vs slow(每事件都查外设属性)", secs);
-    println!("两端订阅同一事件源, 面对完全相同的空中广播。");
+    println!("adapter: {}", central.adapter_info().await?);
+    println!("A/B for {}s: fast (non-blocking) vs slow (queries peripheral props on every event)", secs);
+    println!("Both sides subscribe to the same event source, so they see exactly the same packets on air.");
     println!();
 
     /* 两个订阅者都要在 start_scan 之前订阅 */
-    let mut ev_fast = central.events().await.context("订阅 fast 失败")?;
-    let mut ev_slow = central.events().await.context("订阅 slow 失败")?;
+    let mut ev_fast = central.events().await.context("failed to subscribe the fast side")?;
+    let mut ev_slow = central.events().await.context("failed to subscribe the slow side")?;
 
-    central.start_scan(ScanFilter::default()).await.context("启动扫描失败")?;
+    central.start_scan(ScanFilter::default()).await.context("failed to start scanning")?;
 
     let n_fast = Arc::new(AtomicU64::new(0));
     let n_slow = Arc::new(AtomicU64::new(0));
@@ -111,27 +111,27 @@ async fn main() -> Result<()> {
     let s = n_slow.load(Ordering::Relaxed);
     let ms = slow_await_ms.load(Ordering::Relaxed);
 
-    println!("=== 结果 ===");
-    println!("fast(不阻塞)      收到 {:>5} 个事件", f);
-    println!("slow(旧版做法)    收到 {:>5} 个事件", s);
+    println!("=== results ===");
+    println!("fast (non-blocking)  received {:>5} events", f);
+    println!("slow (the old way)   received {:>5} events", s);
     if f > 0 {
         let lost = f.saturating_sub(s);
         println!(
-            "slow 比 fast 少   {:>5} 个 ({:.1}% 丢失)",
+            "slow is behind by   {:>5} events ({:.1}% lost)",
             lost,
             lost as f64 * 100.0 / f as f64
         );
     }
-    println!("slow 累计阻塞在查属性上: {} ms (平均每事件 {:.1} ms)",
+    println!("slow spent {} ms total blocked on property queries ({:.1} ms per event on average)",
              ms, if s > 0 { ms as f64 / s as f64 } else { 0.0 });
     println!();
     if f > 0 && f.saturating_sub(s) * 100 / f < 2 {
-        println!("丢失接近 0 → 队列溢出【不是】漏收的原因。慢调用读的是本地缓存");
-        println!("(DashMap + RwLock), 不碰系统 API, 快到挤不掉 16 格队列。");
-        println!("真正原因见 main.rs 文件头: 系统扫描窗口稀疏, 用 dupchk 看间隔分布。");
+        println!("Loss near 0 means queue overflow is NOT why packets go missing. The slow call reads a local");
+        println!("cache (DashMap + RwLock), never touches a system API, and is far too fast to overflow a 16-slot queue.");
+        println!("The real cause is in the main.rs header: the OS scan window is sparse. Run dupchk for the gap distribution.");
     } else {
-        println!("出现明显丢失 → 来自 common/adapter_manager.rs:58 的 `.ok()`:");
-        println!("BroadcastStream 滞后时产出 Err(Lagged(n)), 被静默丢弃, 不报错不打日志。");
+        println!("Significant loss points at the `.ok()` in common/adapter_manager.rs:58:");
+        println!("when BroadcastStream lags it yields Err(Lagged(n)), which is dropped silently with no error and no log.");
     }
 
     Ok(())

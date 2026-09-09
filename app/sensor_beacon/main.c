@@ -135,17 +135,20 @@
 #define GPREGRET_ID_COUNTER         0
 
 /* ==================================================================
- *  LATCH 实测探针的总开关(分支 4)
+ *  Master switch for the sleep/wake bring-up path (branch 4)
  * ==================================================================
  *
- * 置 1 后 main() 只跑 LATCH 探针(实现与完整实验设计见本文件 "分支 4" 一节,
- * 就在 rearm_and_off() 下面), 分支 1 的 HX711/按键/BLE 全部不编译 ——
- * 两者互斥, 因为探针不返回。
+ * Set to 1 and main() runs only the "enter System OFF -> get woken -> report
+ * the wake source -> re-arm -> back to System OFF" loop. Branch 1 (HX711,
+ * keys, BLE, storage) is then NOT compiled at all: the two are mutually
+ * exclusive because the test path never returns.
  *
- * 这不是功能代码, 是一次【一次性实验】: 验证 GPIO->LATCH 能否跨 System OFF
- * 唤醒复位保留。结论决定"多唤醒脚时怎么反推是哪个脚醒的"该怎么写。
- * 测完请改回 0。 */
-#define LATCH_PROBE_ENABLED         0
+ * Implementation and full rationale live in the "Branch 4" section of this
+ * file, immediately below rearm_and_off().
+ *
+ * This is not product code, it is a bare bring-up path. Set it back to 0 when
+ * the measurement is done. */
+#define SLEEP_WAKE_TEST_ENABLED     0
 
 /* ==================================================================
  *  HX711 引脚 & 参数
@@ -536,217 +539,364 @@ static void rearm_and_off(nrf_gpio_pin_sense_t sense)
 }
 
 /* ==================================================================
- *  分支 4 —— LATCH 实测探针: GPIO->LATCH 能否跨 System OFF 唤醒保留?
+ *  Branch 4 -- sleep/wake bring-up: System OFF entry/exit + wake source ID
  * ==================================================================
  *
- * 【要回答的问题】
+ * WHAT THIS PATH COVERS, AND WHAT IT DELIBERATELY DOES NOT
  *
- * System OFF 唤醒等于复位, 而 RESETREAS 只有一个 OFF 位(bit16), 它只说明
- * "本次是被 DETECT 唤醒的", 【不说是哪个脚】。所以一旦同时武装多个唤醒脚,
- * 就需要别的手段反推唤醒源。候选有两个:
+ *   Covered:     entering System OFF, waking through GPIO SENSE (a wake is a
+ *                reset), identifying which pin woke us, flipping SENSE and
+ *                re-arming, going back to System OFF, plus GPREGRET retention
+ *                across the sleep.
+ *   Not covered: BLE advertising, SAADC battery sampling, HX711 sampling,
+ *                flash records -- none of it is compiled in this branch.
  *
- *   A) 开机读各脚电平 —— 分支 3 的 boot_read_and_classify() 就是这么干的。
- *      缺陷: 若外部信号是短脉冲, 醒过来时电平已经变回去了, 反推失败。
- *   B) 读 GPIO->LATCH —— 每脚一位(GPIO_LATCH_PIN0..PIN31), 只要该脚的 SENSE
- *      判据【曾经】满足过就置 1, 是粘滞的, 不怕脉冲。
+ * Stripped to the bone on purpose. Sleep/wake is the foundation of the whole
+ * chain; mixing sampling and advertising in before that foundation is solid
+ * only makes "which stage actually broke" impossible to pin down. Branch 3
+ * (#if 0) still holds the complete "sample + advertise" reference timing --
+ * fold that back in once this path passes.
  *
- * B 明显更好, 但它成立的前提无法从本仓库内证实(数据手册不在树里):
- * "LATCH 在 System OFF 唤醒复位之后还在不在"。本探针就是为了实测这一条。
+ * !! This branch never enables the SoftDevice. Upside: shortest possible path,
+ *    lowest static current, and GPREGRET / RESETREAS / SYSTEMOFF can all be
+ *    touched as plain registers with no need to branch on SD state.
+ *    Downside: the sd_power_system_off() call at the end of
+ *    handle_event_active() is NOT exercised here -- verify that one separately
+ *    when advertising is wired back in.
  *
- * 【已核对的事实 —— 基于 SDK 头文件, 不是记忆】
+ * THE TWO WAKE PINS HAVE OPPOSITE POLARITY -- easiest thing to get wrong here
  *
- *   - SENSE 是每个脚 PIN_CNF[n] 里的 2 位字段(nrf52810_bitfields.h 的
- *     GPIO_PIN_CNF_SENSE_Pos = 16), 不是共享通道资源 → 唤醒脚数量【不受
- *     预算限制】, 32 个 GPIO 都能同时武装。别与 GPIOTE 的 8 个通道搞混。
- *   - LATCH 是【写 1 清除】(见 nrf_gpio_pin_latch_clear: reg->LATCH = 1<<pin)。
- *   - nrfx_gpiote.c 【完全没碰】DETECTMODE, 所以它停在 Default(DETECT 直连
- *     引脚)而非 LDETECT。本探针也不切: LATCH 的置位与 DETECTMODE 无关,
- *     DETECTMODE 只决定 DETECT 信号从哪里取。
- *   - nRF52810 【无 LPCOMP、无 NFCT】(nrf52810_peripherals.h 里只有
- *     COMP_PRESENT), 所以 System OFF 的唤醒源只有 GPIO DETECT + 复位脚 +
- *     调试器三种。"用片内比较器唤醒"这条路在这颗芯片上不存在。
- *   - nRF52810 上【没有 NRF_GPIO 这个符号】, 只有 NRF_P0(NRF_GPIO 别名仅在
- *     legacy 兼容头 nrf51_to_nrf52810.h 里)。所以下面一律走 nrf_gpio HAL,
- *     只有"清全部 latch"没有 HAL 对应函数, 才直接写 NRF_P0->LATCH。
+ *   WAKE_PIN    (P0.22): pull-up, external comparator drives it HIGH on an
+ *                        event                        -> active level = HIGH
+ *   DRV_KEY_PIN (P0.14): pull-up, button shorts to ground when pressed
+ *                                                     -> active level = LOW
  *
- * 【实验设计 —— 顺序是关键, 错一步结论就不成立】
+ *   The requirement is "a button wake behaves exactly like the existing
+ *   high-level wake", so the two pins must NOT both be treated as "high means
+ *   event". Instead every pin carries its own active level (see m_wake_src) and
+ *   the state machine reasons in terms of active/inactive rather than HIGH/LOW.
+ *   That way both pins share one code path, and adding a third pin is just one
+ *   more table row.
  *
- *   进 OFF 前: ① 读电平 → ② 武装 SENSE 到【相反】方向 → ③ 清 LATCH
- *              → ④ 回读 LATCH 自检 → ⑤ 写 SYSTEMOFF
- *   醒来之后:  ⑥ main() 第一批指令里快照 RESETREAS + LATCH + 电平 → ⑦ 打印
+ * THE SENSE-FLIP STATE MACHINE, GENERALISED TO SEVERAL PINS
  *
- * ⚠ ③ 必须在 ② 【之后】。武装 SENSE 的那一刻若引脚已满足判据, 硬件会立刻置
- *   LATCH。若先清后武装, 这个"武装动作自己造出来的 latch"会留在寄存器里 ——
- *   醒来读到 1, 却分不清是本次休眠期间的外部信号还是武装动作自造的,
- *   整个实验就白做了。
+ *   The single-pin original hides its state in the pin level itself. With
+ *   several pins each one hides its own copy, and the rule is unchanged:
  *
- * ⚠ ④ 是数据可信度自检。清完立刻又变 1 → 该脚判据【持续】满足(例如武装了
- *   SENSE_LOW 而外部一直是低), 那这一轮根本进不去 OFF 或者立刻就醒。此时
- *   探针打印 "ARM CONFLICT" 并明确说明本轮数据作废, 而不是给出错误结论。
+ *       pin currently active   -> mid-event (or the button is still held)
+ *                                 -> arm for inactive, i.e. wait for release
+ *       pin currently inactive -> idle
+ *                                 -> arm for active, i.e. wait for an event
  *
- * ⚠ ⑥ 必须是 main() 的最前面。任何对 PIN_CNF 的写都可能改变 LATCH ——
- *   log_init() 配 UART 引脚(P0.06)也算。所以"快照"与"打印"拆成两个函数:
- *   快照在 log_init() 之前, 打印在之后。
+ *   That is just rearm_and_off()'s "read the level, arm the opposite
+ *   direction", applied per pin. No state variable has to survive the sleep,
+ *   which is exactly the point of the original design -- and it still holds
+ *   once generalised.
  *
- * ⚠⚠ 【必须断开 SWD 调试器再跑】。调试器连着时 System OFF 被仿真, 芯片不会
- *   真的复位 —— 那样测到的是"运行态 LATCH 保不保留", 与要问的问题无关, 而且
- *   会得到一个假的"保留"结论。正确做法: 电池或 USB 供电, 只接 UART
- *   (P0.06, 115200 8N1)看日志。探针自己会检查 RESETREAS.OFF, 若为 0 会直接
- *   警告"这不是 System OFF 唤醒"。
+ *   Whether a given wake is an event or a release follows from all pin levels
+ *   taken together:
+ *       any pin active -> EVENT   (equivalent to the old high-level path,
+ *                                  counter += 1)
+ *       all pins idle  -> RELEASE (equivalent to the old low-level path,
+ *                                  no counting)
+ *
+ *   So one physical event still produces exactly two wakes: one EVENT plus one
+ *   RELEASE. In the log, round (total wakes) should come out at roughly twice
+ *   counter (event count) -- an assertion you can check by eye.
+ *
+ * IDENTIFYING THE WAKE SOURCE -- TWO COMPLEMENTARY CRITERIA
+ *
+ *   A) GPIO->LATCH: one bit per pin, set as soon as that pin's SENSE criterion
+ *      has EVER been met, and sticky -- so it survives short pulses.
+ *      !! Whether it survives the System OFF wake-up reset cannot be
+ *         established from this repo (the datasheet is not in the tree).
+ *         Proving that is the second thing this branch measures.
+ *   B) Current pin level: whichever pins read as active.
+ *      !! Misses short pulses -- tap the button quickly and it may already be
+ *         released by the time the reset finishes, level already back to idle.
+ *
+ *   Both are printed. If LATCH lines up every time, use A from here on. If
+ *   LATCH always reads 0 it was cleared by the reset, leaving only B plus the
+ *   "a quick tap gets missed" caveat that comes with it.
+ *
+ * ORDERING -- GET ONE STEP WRONG AND THE RESULT MEANS NOTHING
+ *
+ *   Before OFF: (1) read each pin level -> (2) arm SENSE to the opposite
+ *               direction -> (3) clear LATCH -> (4) read LATCH back as a
+ *               self-check -> (5) write SYSTEMOFF
+ *   After wake: (6) snapshot RESETREAS + LATCH + levels in the very first
+ *               instructions of main() -> (7) print
+ *
+ * !! (3) must come AFTER (2). The instant SENSE is armed, if the pin already
+ *    meets the criterion the hardware sets LATCH right away. Clear-then-arm
+ *    leaves that self-inflicted latch sitting in the register: on the next wake
+ *    it reads as 1 with no way to tell it apart from a real external event, and
+ *    wake-source identification becomes worthless.
+ *
+ * !! (4) is a credibility self-check. If LATCH goes back to 1 immediately after
+ *    being cleared, some pin meets its criterion CONTINUOUSLY (for example
+ *    armed SENSE_LOW while the outside world holds it low) -- that round will
+ *    never reach OFF, or will wake instantly. It prints ARM CONFLICT and
+ *    declares the round void rather than reporting a wrong conclusion.
+ *
+ * !! (6) must be the very first thing in main(), and LATCH must be read BEFORE
+ *    any GPIO configuration. Two reasons:
+ *      - log_init() configures the UART pin P0.06, which is a PIN_CNF write;
+ *      - a reset returns PIN_CNF to its default of "input buffer disconnected",
+ *        so reading a level requires nrf_gpio_cfg_input() first (branch 3 does
+ *        the same) -- and that is a PIN_CNF write too.
+ *    Hence the fixed order: read LATCH -> configure inputs -> read levels. That
+ *    is also why snapshot and report are two separate functions.
+ *
+ * !!!! DISCONNECT THE SWD DEBUGGER BEFORE RUNNING THIS. With a debugger
+ *    attached, System OFF is emulated and the chip never actually resets:
+ *    RESETREAS.OFF comes back 0 and LATCH yields a bogus "retained" verdict.
+ *    Run from battery or USB with only the UART attached (P0.06, 115200 8N1).
+ *    This branch checks RESETREAS.OFF itself and warns when it is 0.
+ *
+ * !! Read this before measuring current: a pull-up held low by the outside
+ *    world draws VDD/13kOhm ~= 250uA, while System OFF itself is only ~0.4uA.
+ *    So check the "leak" line in the log first:
+ *      - WAKE_PIN armed SENSE_HIGH while the external signal idles low
+ *        -> 250uA for the whole sleep
+ *      - KEY armed SENSE_HIGH (button held, waiting for release) -> 250uA
+ *    Not a bug, just what a pull-up does. To measure true deep-sleep current,
+ *    first make the external level match the pull direction, or switch that pin
+ *    to NOPULL.
  */
 
-#if LATCH_PROBE_ENABLED
+#if SLEEP_WAKE_TEST_ENABLED
 
-/* 探针要武装的候选唤醒脚。两个都武装 —— 顺带验证"多脚唤醒能否靠 LATCH 区分"。
- *   DRV_KEY_PIN(P0.14) : 按键, 上拉 + active-low, 静态高 → 无漏流, 最理想
- *   WAKE_PIN   (P0.22) : 外部信号 */
-static const uint8_t m_probe_pins[] = { DRV_KEY_PIN, WAKE_PIN };
-#define PROBE_PIN_COUNT     (sizeof(m_probe_pins) / sizeof(m_probe_pins[0]))
+/* One wake source. */
+typedef struct
+{
+    uint8_t              pin;
+    nrf_gpio_pin_pull_t  pull;
+    bool                 active_high;   /* true: high means event; false: low */
+    const char *         name;          /* padded so log columns line up */
+} wake_src_t;
 
-/* 醒来第一时间的寄存器快照。 */
+/* !! active_high must match how the hardware is actually wired. Get it
+ *    backwards and the direction being armed is already satisfied, so the chip
+ *    never reaches OFF or wakes instantly. Step (4)'s ARM CONFLICT check will
+ *    catch that, but getting it right up front is better. */
+static const wake_src_t m_wake_src[] =
+{
+    { WAKE_PIN,    WAKE_PIN_PULL,       true,  "WAKE(P0.22 external)" },
+    { DRV_KEY_PIN, NRF_GPIO_PIN_PULLUP, false, "KEY (P0.14 button)  " },
+};
+#define WAKE_SRC_COUNT      (sizeof(m_wake_src) / sizeof(m_wake_src[0]))
+
+/* Register snapshot taken the instant we wake. */
 typedef struct
 {
     uint32_t resetreas;
-    uint32_t latch;                     /* 整个 P0 的 LATCH, 32 位 */
-    uint32_t round;                     /* 第几轮(存 GPREGRET2, 跨 OFF 保持) */
-    uint8_t  level[PROBE_PIN_COUNT];    /* 各候选脚的即时电平 */
-} latch_probe_t;
+    uint32_t latch;                     /* whole-port LATCH for P0 */
+    bool     woke_from_off;             /* verdict from boot_read_and_classify */
+    uint32_t round;                     /* total wake count, kept in GPREGRET2 */
+    uint8_t  level[WAKE_SRC_COUNT];     /* per-pin level, 1 = high */
+    bool     active[WAKE_SRC_COUNT];    /* per-pin: sitting at its active level */
+} wake_snap_t;
 
-/* ⚠ 必须是 main() 的第一批指令, 见上方 ⑥。本函数【只读不改】GPIO。 */
-static void latch_probe_snapshot(latch_probe_t * p)
+/* !! Must be the very first thing main() does -- see note (6) above. */
+static void wake_test_snapshot(wake_snap_t * s)
 {
-    p->resetreas = NRF_POWER->RESETREAS;
+    /* (6a) Grab LATCH first: no GPIO write has happened yet at this point. */
+    nrf_gpio_latches_read(0, 1, &s->latch);
 
-    /* 先把 LATCH 抓走, 后面一个字节都别动 GPIO。
-     * 用 HAL 而不是 NRF_P0->LATCH: 前者在 GPIO_COUNT>1 的芯片上也对。 */
-    nrf_gpio_latches_read(0, 1, &p->latch);
+    /* Reuse the real boot classifier rather than duplicating it: it reads and
+     * clears RESETREAS, restores m_counter from GPREGRET, and zeroes the
+     * counter on a cold start. It touches no GPIO, so it is safe here. */
+    s->woke_from_off = boot_read_and_classify(&s->resetreas);
 
-    for (uint8_t i = 0; i < PROBE_PIN_COUNT; i++)
+    /* GPREGRET2, not GPREGRET: register 0 is taken by the application's event
+     * counter (GPREGRET_ID_COUNTER). Sharing it would tangle the two. */
+    s->round = NRF_POWER->GPREGRET2;
+
+    /* (6b) Only now configure the inputs. A reset leaves PIN_CNF at "input
+     *      buffer disconnected", so without this nrf_gpio_pin_read() returns 0
+     *      instead of the real level. */
+    for (uint8_t i = 0; i < WAKE_SRC_COUNT; i++)
     {
-        p->level[i] = (uint8_t)nrf_gpio_pin_read(m_probe_pins[i]);
+        nrf_gpio_cfg_input(m_wake_src[i].pin, m_wake_src[i].pull);
     }
 
-    /* GPREGRET2 而不是 GPREGRET: 0 号被应用的事件计数器占着
-     * (GPREGRET_ID_COUNTER), 借来用会把两个实验的状态搅在一起。 */
-    p->round = NRF_POWER->GPREGRET2;
-
-    NRF_POWER->RESETREAS = 0xFFFFFFFF;      /* 写 1 清除, 便于下一轮判定 */
+    for (uint8_t i = 0; i < WAKE_SRC_COUNT; i++)
+    {
+        uint8_t lv   = (uint8_t)nrf_gpio_pin_read(m_wake_src[i].pin);
+        s->level[i]  = lv;
+        s->active[i] = ((lv != 0) == m_wake_src[i].active_high);
+    }
 }
 
-/* 打印快照 → 武装唤醒脚 → 进 System OFF。【不返回】。 */
-static void latch_probe_run(const latch_probe_t * p)
+/* Report the snapshot, classify EVENT vs RELEASE, re-arm every wake pin and
+ * enter System OFF. Never returns. */
+static void wake_test_run(wake_snap_t * s)
 {
-    bool woke_from_off = (p->resetreas & POWER_RESETREAS_OFF_Msk) != 0;
+    /* ================= (7) report ================= */
+    NRF_LOG_INFO("======== SLEEP/WAKE round #%u ========", s->round);
+    NRF_LOG_INFO("  RESETREAS = 0x%08x  [OFF=%u RESETPIN=%u SREQ=%u DOG=%u]",
+                 s->resetreas,
+                 (s->resetreas & POWER_RESETREAS_OFF_Msk)      ? 1u : 0u,
+                 (s->resetreas & POWER_RESETREAS_RESETPIN_Msk) ? 1u : 0u,
+                 (s->resetreas & POWER_RESETREAS_SREQ_Msk)     ? 1u : 0u,
+                 (s->resetreas & POWER_RESETREAS_DOG_Msk)      ? 1u : 0u);
+    NRF_LOG_INFO("  LATCH     = 0x%08x", s->latch);
+    NRF_LOG_INFO("  counter   = %u events / round #%u wakes (expect ~2x events)",
+                 m_counter, s->round);
 
-    NRF_LOG_INFO("======== LATCH PROBE round #%u ========", p->round);
-    NRF_LOG_INFO("  RESETREAS = 0x%08x  [OFF=%u RESETPIN=%u SREQ=%u]",
-                 p->resetreas,
-                 woke_from_off ? 1u : 0u,
-                 (p->resetreas & POWER_RESETREAS_RESETPIN_Msk) ? 1u : 0u,
-                 (p->resetreas & POWER_RESETREAS_SREQ_Msk)     ? 1u : 0u);
-    NRF_LOG_INFO("  LATCH     = 0x%08x", p->latch);
+    bool any_active = false;
 
-    for (uint8_t i = 0; i < PROBE_PIN_COUNT; i++)
+    for (uint8_t i = 0; i < WAKE_SRC_COUNT; i++)
     {
-        uint8_t pin = m_probe_pins[i];
-        NRF_LOG_INFO("    P0.%02u : latch=%u  level=%s",
-                     pin,
-                     (p->latch >> pin) & 1u,
-                     p->level[i] ? "HIGH" : "LOW");
+        NRF_LOG_INFO("    %s : latch=%u level=%s -> %s",
+                     m_wake_src[i].name,
+                     (s->latch >> m_wake_src[i].pin) & 1u,
+                     s->level[i] ? "HIGH" : "LOW",
+                     s->active[i] ? "ACTIVE" : "idle");
+        if (s->active[i])
+        {
+            any_active = true;
+        }
     }
 
-    /* ---------------- 结论判定 ---------------- */
-    if (p->round == 0)
+    /* ================= wake source verdict ================= */
+    if (s->round == 0)
     {
-        /* 冷启动(上电/掉电复位会清 GPREGRET2)。这一轮 RESETREAS 里没有 OFF 位,
-         * LATCH 也没有意义 —— 只负责武装然后睡下去。结论从第 1 轮开始看。 */
-        NRF_LOG_INFO("  verdict   : cold boot, this round only arms.  ");
-        NRF_LOG_INFO("              trigger a wake-up (button or drive P0.%02u), watch the next round.",
-                     WAKE_PIN);
+        NRF_LOG_INFO("  wake src  : none (cold start)");
     }
-    else if (!woke_from_off)
+    else if (!s->woke_from_off)
     {
-        NRF_LOG_WARNING("  verdict   : NOT a System OFF wake-up (RESETREAS.OFF=0).");
-        NRF_LOG_WARNING("              this round's data is invalid. Most likely the SWD debugger is");
-        NRF_LOG_WARNING("              still connected: System OFF is emulated, chip did not reset.");
+        NRF_LOG_WARNING("  wake src  : unknown -- this was NOT a System OFF wake (OFF=0).");
+        NRF_LOG_WARNING("              Most likely the SWD debugger is still attached,");
+        NRF_LOG_WARNING("              so System OFF got emulated. Otherwise the reset");
+        NRF_LOG_WARNING("              pin was used (check RESETPIN). Round is void.");
     }
-    else if (p->latch == 0)
+    else if (s->latch != 0)
     {
-        NRF_LOG_WARNING("  verdict   : LATCH NOT retained - cleared by the wake-up reset.");
-        NRF_LOG_WARNING("              -> wake source can only be inferred from pin levels at boot");
-        NRF_LOG_WARNING("                 (branch 3), which misses short pulses. Need another scheme.");
+        NRF_LOG_INFO("  wake src  : from LATCH (sticky, survives short pulses):");
+        for (uint8_t i = 0; i < WAKE_SRC_COUNT; i++)
+        {
+            if ((s->latch >> m_wake_src[i].pin) & 1u)
+            {
+                NRF_LOG_INFO("              --> %s", m_wake_src[i].name);
+            }
+        }
+        NRF_LOG_INFO("  ** VERDICT: LATCH SURVIVES the System OFF wake reset,");
+        NRF_LOG_INFO("     so it is usable as the wake source criterion. **");
     }
     else
     {
-        NRF_LOG_INFO("  verdict   : LATCH retained - usable for wake-source inference.");
-        NRF_LOG_INFO("              -> the pin with latch=1 above is this round's wake source;");
-        NRF_LOG_INFO("                 valid for short pulses too (sticky bit, level-independent at wake).");
+        NRF_LOG_WARNING("  ** VERDICT: LATCH reads all zero, so it is CLEARED by the");
+        NRF_LOG_WARNING("     wake reset and cannot identify the wake source. **");
+        if (any_active)
+        {
+            NRF_LOG_WARNING("  wake src  : falling back to pin levels, ACTIVE ones above.");
+        }
+        else
+        {
+            NRF_LOG_WARNING("  wake src  : cannot tell -- every pin is back to idle.");
+            NRF_LOG_WARNING("              This is exactly the case where reading levels");
+            NRF_LOG_WARNING("              fails: a short pulse or a quick button tap.");
+        }
     }
-    NRF_LOG_FLUSH();
 
-    /* ---------------- 武装下一轮 ---------------- */
-    NRF_POWER->GPREGRET2 = p->round + 1;
-
-    for (uint8_t i = 0; i < PROBE_PIN_COUNT; i++)
+    /* ================= EVENT vs RELEASE ================= */
+    if (s->round == 0)
     {
-        uint8_t pin = m_probe_pins[i];
-
-        /* 每脚按各自的上/下拉: P0.14 是 active-low 按键, 必须保持上拉
-         * (与 drv_key.c 的 KEY_PULL_CFG 一致); P0.22 用 WAKE_PIN_PULL(当前下拉)。
-         * ⚠ 外部电平与内部电阻方向相反时漏流 ≈ VDD/13k ≈ 250µA, 会把 0.4µA
-         *   的深睡功耗彻底废掉。实验期间无所谓, 但接进产品前必须按外部电路是
-         *   开漏还是推挽重新定这一项。 */
-        nrf_gpio_pin_pull_t pull = (pin == WAKE_PIN)
-                                   ? WAKE_PIN_PULL
-                                   : NRF_GPIO_PIN_PULLUP;
-        nrf_gpio_cfg_input(pin, pull);
-
-        /* ② 武装到与当前电平【相反】的方向。硬件不支持"任意边沿", 且若武装成
-         *    与当前电平相同的方向, 判据立刻满足 → 立刻 DETECT → 根本进不去 OFF。
-         *    做法与 rearm_and_off() 一致。 */
-        nrf_gpio_pin_sense_t sense = nrf_gpio_pin_read(pin)
-                                     ? NRF_GPIO_PIN_SENSE_LOW
-                                     : NRF_GPIO_PIN_SENSE_HIGH;
-        nrf_gpio_cfg_sense_set(pin, sense);
+        NRF_LOG_INFO("  action    : cold start, arm only.");
+    }
+    else if (any_active)
+    {
+        /* Equivalent to the original high-level path, handle_event_active().
+         * !! This branch stops right here -- settling wait, battery sample,
+         *    payload build and advertising are all skipped. */
+        m_counter = (uint8_t)(m_counter + 1);
+        NRF_LOG_INFO("  action    : EVENT (was the high-level path) -> counter=%u",
+                     m_counter);
+        NRF_LOG_INFO("              branch 3 would settle, sample and advertise here.");
+    }
+    else
+    {
+        NRF_LOG_INFO("  action    : RELEASE (was the low-level path) -> re-arm only.");
     }
 
-    /* ③ 武装【之后】清 LATCH, 把武装动作自己造出来的 latch 一并清掉。
-     * 清全部而不是只清两个候选脚: 这样醒来打印的 LATCH 若非 0, 一定是本次休眠
-     * 期间发生的事, 结论无歧义。
-     * ⚠ 直接写寄存器是因为 nrf_gpio HAL 只有按脚清(nrf_gpio_pin_latch_clear),
-     *   没有"清全部"; 且 nRF52810 上必须用 NRF_P0(无 NRF_GPIO 符号)。 */
+    /* ================= (1)(2) re-arm ================= */
+    /* SD is never enabled in this branch, so plain register writes are correct.
+     * If this branch ever enables the SoftDevice these two lines must become
+     * sd_power_gpregret_set()/clr(), otherwise the writes silently do nothing. */
+    NRF_POWER->GPREGRET  = m_counter;
+    NRF_POWER->GPREGRET2 = s->round + 1;
+
+    uint32_t leak_mask = 0;
+
+    for (uint8_t i = 0; i < WAKE_SRC_COUNT; i++)
+    {
+        const wake_src_t * w = &m_wake_src[i];
+
+        nrf_gpio_cfg_input(w->pin, w->pull);
+
+        /* (2) Read the level, arm the OPPOSITE direction. The hardware has no
+         *     "any edge" mode, and arming the direction that already matches
+         *     the current level satisfies the criterion at once -- the chip
+         *     would never reach System OFF. */
+        bool lv_high = (nrf_gpio_pin_read(w->pin) != 0);
+        nrf_gpio_cfg_sense_set(w->pin, lv_high ? NRF_GPIO_PIN_SENSE_LOW
+                                               : NRF_GPIO_PIN_SENSE_HIGH);
+
+        NRF_LOG_INFO("  arm       : %s is %s -> armed SENSE_%s",
+                     w->name,
+                     lv_high ? "HIGH" : "LOW",
+                     lv_high ? "LOW"  : "HIGH");
+
+        /* Internal pull-up plus an external low means ~250uA for the whole
+         * sleep. Collect them so the log can warn once, below. */
+        if ((w->pull == NRF_GPIO_PIN_PULLUP) && !lv_high)
+        {
+            leak_mask |= (1UL << w->pin);
+        }
+    }
+
+    /* ================= (3) clear LATCH, after arming ================= */
+    /* Clear the whole register rather than just the candidate pins: that way a
+     * non-zero LATCH on the next wake can only have come from this sleep, so
+     * the verdict is unambiguous.
+     * !! Direct register write because the nrf_gpio HAL only offers per-pin
+     *    clearing (nrf_gpio_pin_latch_clear), and because nRF52810 has no
+     *    NRF_GPIO symbol at all -- only NRF_P0. */
     NRF_P0->LATCH = 0xFFFFFFFFUL;
 
-    /* ④ 回读自检。 */
+    /* ================= (4) self-check ================= */
     uint32_t after = 0;
     nrf_gpio_latches_read(0, 1, &after);
 
     if (after != 0)
     {
-        NRF_LOG_ERROR("  ARM CONFLICT: LATCH cannot be cleared (0x%08x).", after);
-        NRF_LOG_ERROR("                some pin's SENSE condition is continuously met -> this round will");
-        NRF_LOG_ERROR("                wake immediately; data void. Check external levels & pull config.");
+        NRF_LOG_ERROR("  ARM CONFLICT: LATCH will not clear (0x%08x). Some pin meets",
+                      after);
+        NRF_LOG_ERROR("                its criterion continuously, so this round will");
+        NRF_LOG_ERROR("                wake at once and the data is void. Check whether");
+        NRF_LOG_ERROR("                active_high is backwards, then check the external");
+        NRF_LOG_ERROR("                level against the pull configuration.");
     }
-    else
-    {
-        NRF_LOG_INFO("  armed     : LATCH cleared, SENSE armed to opposite edge on %u pins.",
-                     (uint32_t)PROBE_PIN_COUNT);
-        NRF_LOG_INFO("              entering System OFF, waiting for wake-up.");
-    }
-    NRF_LOG_FLUSH();
 
-    NRF_POWER->SYSTEMOFF = 1;
-    __DSB();
-
-    /* 走到这里只有一个原因: 调试器连着, System OFF 被仿真了。
-     * 下一轮的 RESETREAS.OFF 会是 0, 探针会明确报"这不是 System OFF 唤醒"。 */
-    for (;;)
+    if (leak_mask != 0)
     {
-        __WFE();
+        NRF_LOG_WARNING("  leak      : pins in mask 0x%08x are pulled up internally but",
+                        leak_mask);
+        NRF_LOG_WARNING("              held low externally -> about 250uA each for the");
+        NRF_LOG_WARNING("              whole sleep. Clear this before measuring current.");
     }
+
+    NRF_LOG_INFO("  -> System OFF. Wake it by tapping P0.%02u, or driving P0.%02u.",
+                 DRV_KEY_PIN, WAKE_PIN);
+
+    /* Reuse the real System OFF helper (it flushes the log itself), which also
+     * gets that function exercised. */
+    system_off_direct();
 }
 
-#endif /* LATCH_PROBE_ENABLED */
+#endif /* SLEEP_WAKE_TEST_ENABLED */
 
 /* ==================================================================
  *  唤醒引脚 —— 运行态的边沿中断(联调用, 与 System OFF 的 SENSE 唤醒互补)
@@ -1683,12 +1833,13 @@ static void ble_start(void)
 
 int main(void)
 {
-#if LATCH_PROBE_ENABLED
-    /* ⚠ 必须是 main() 的第一批指令: 任何对 PIN_CNF 的写都可能改变 LATCH,
-     *   而 log_init() 就会去配 UART 的 P0.06。所以"快照"必须早于 log_init(),
-     *   "打印"只能晚于它 —— 这就是探针拆成两个函数的原因。 */
-    latch_probe_t probe_snap;
-    latch_probe_snapshot(&probe_snap);
+#if SLEEP_WAKE_TEST_ENABLED
+    /* !! Must be the very first thing main() does: any PIN_CNF write can alter
+     *    LATCH, and log_init() configures the UART pin P0.06. So the snapshot
+     *    has to happen before log_init() while the report has to happen after
+     *    it -- that is why they are two functions. See note (6) in branch 4. */
+    wake_snap_t wake_snap;
+    wake_test_snapshot(&wake_snap);
 #endif
 
     log_init();
@@ -1697,12 +1848,13 @@ int main(void)
         // NRF_LOG_FLUSH();
     }
 
-#if LATCH_PROBE_ENABLED
-    /* 不返回: 打印 → 武装 → System OFF。与下面分支 1 互斥。 */
-    latch_probe_run(&probe_snap);
+#if SLEEP_WAKE_TEST_ENABLED
+    /* Never returns: report the wake source, re-arm, enter System OFF.
+     * Mutually exclusive with branch 1 below. */
+    wake_test_run(&wake_snap);
 #endif
 
-#if !LATCH_PROBE_ENABLED
+#if !SLEEP_WAKE_TEST_ENABLED
     /* ===== 分支 1: HX711 定时读取两通道 + 按键/LED + BLE(默认静默) ===== */
 
     /* 1) 使能 BLE 协议栈 (提供 LFCLK 给 app_timer) */

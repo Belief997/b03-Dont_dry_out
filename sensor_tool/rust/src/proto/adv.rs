@@ -62,11 +62,11 @@ impl std::fmt::Display for AdvParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::BadLength { got, want } => {
-                write!(f, "载荷长度 {got}, 期望 {want}")
+                write!(f, "payload is {got} bytes, expected {want}")
             }
-            Self::BadMagic { got } => write!(f, "魔数 0x{got:02X}, 期望 0x{MAGIC:02X}"),
+            Self::BadMagic { got } => write!(f, "bad magic 0x{got:02X}, expected 0x{MAGIC:02X}"),
             Self::UnsupportedVersion { got } => {
-                write!(f, "不支持的协议版本 0x{got:02X}")
+                write!(f, "unsupported protocol version 0x{got:02X}")
             }
         }
     }

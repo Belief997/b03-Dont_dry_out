@@ -26,18 +26,18 @@ async fn main() -> Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(15);
 
-    let manager = Manager::new().await.context("创建蓝牙管理器失败")?;
-    let adapters = manager.adapters().await.context("枚举适配器失败")?;
+    let manager = Manager::new().await.context("failed to create the Bluetooth manager")?;
+    let adapters = manager.adapters().await.context("failed to enumerate adapters")?;
     if adapters.is_empty() {
-        bail!("未找到蓝牙适配器");
+        bail!("no Bluetooth adapter found");
     }
     let central = adapters.into_iter().next().unwrap();
-    println!("适配器: {}", central.adapter_info().await?);
-    println!("不做任何过滤, 统计 {} 秒内的全部 BLE 事件...", secs);
+    println!("adapter: {}", central.adapter_info().await?);
+    println!("No filtering at all: counting every BLE event for {}s...", secs);
     println!();
 
-    let mut events = central.events().await.context("订阅事件失败")?;
-    central.start_scan(ScanFilter::default()).await.context("启动扫描失败")?;
+    let mut events = central.events().await.context("failed to subscribe to events")?;
+    central.start_scan(ScanFilter::default()).await.context("failed to start scanning")?;
 
     let t0 = Instant::now();
     let mut n_disc = 0u64;
@@ -69,7 +69,7 @@ async fn main() -> Result<()> {
                     for (cid, data) in manufacturer_data {
                         *by_company.entry(cid).or_insert(0) += 1;
                         if cid == 0xFFFF {
-                            println!("  0xFFFF 段 {} 字节: {:02X?}", data.len(), data);
+                            println!("  0xFFFF section, {} bytes: {:02X?}", data.len(), data);
                         }
                     }
                 }
@@ -82,26 +82,26 @@ async fn main() -> Result<()> {
     let el = t0.elapsed().as_secs_f64();
     let total = n_disc + n_upd + n_manu + n_serv + n_other;
     println!();
-    println!("=== {:.1} 秒统计 ===", el);
+    println!("=== {:.1}s summary ===", el);
     println!("DeviceDiscovered              : {}", n_disc);
     println!("DeviceUpdated                 : {}", n_upd);
     println!("ManufacturerDataAdvertisement : {}", n_manu);
     println!("ServiceDataAdvertisement      : {}", n_serv);
-    println!("其它                          : {}", n_other);
-    println!("合计 {} 个事件, {:.1} 事件/秒", total, total as f64 / el);
-    println!("不同设备数: {}", devices.len());
+    println!("Other                         : {}", n_other);
+    println!("{} events total, {:.1} events/s", total, total as f64 / el);
+    println!("distinct devices: {}", devices.len());
     println!();
-    println!("按 Company ID 分布(前 10):");
+    println!("distribution by Company ID (top 10):");
     let mut v: Vec<_> = by_company.into_iter().collect();
     v.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
     for (cid, n) in v.iter().take(10) {
-        let tag = if *cid == 0xFFFF { "  <-- 本项目" } else { "" };
-        println!("  0x{:04X} : {:>5} 包{}", cid, n, tag);
+        let tag = if *cid == 0xFFFF { "  <-- this project" } else { "" };
+        println!("  0x{:04X} : {:>5} packets{}", cid, n, tag);
     }
     println!();
-    println!("以上只是环境噪声基线。注意: 队列溢出【已被 ab.rs 实测排除】——");
-    println!("  两端(阻塞/不阻塞)都收到同样多的事件, 丢失 0%。漏收的真正原因是");
-    println!("  系统扫描窗口稀疏(约每秒一次), 见 dupchk.rs 的到达间隔统计与 main.rs 文件头。");
+    println!("The above is just an ambient noise baseline. Note that queue overflow has been RULED OUT by ab.rs:");
+    println!("  both sides (blocking and non-blocking) received the same number of events, 0% lost. Packets go");
+    println!("  missing because the OS scan window is sparse (roughly once a second) -- see the gap stats in dupchk.rs and the main.rs header.");
 
     Ok(())
 }

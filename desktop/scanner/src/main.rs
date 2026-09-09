@@ -183,18 +183,18 @@ fn print_beacon(addr: Option<BDAddr>, rssi: Option<i16>, b: &BeaconData) {
     println!("==============================");
     println!(
         "MAC       : {}",
-        addr.map_or_else(|| "(未知)".to_string(), |a| a.to_string())
+        addr.map_or_else(|| "(unknown)".to_string(), |a| a.to_string())
     );
     println!(
         "RSSI      : {}",
         rssi.map_or_else(|| "n/a".to_string(), |v| format!("{} dBm", v))
     );
-    println!("设备ID    : 0x{:04X} ({})", b.dev_id, b.dev_id);
-    println!("计数器    : {}", b.counter);
-    println!("电池      : {} mV", b.batt_mv);
-    println!("ch0(#1 chA, 增益128) = {:>8}", b.ch0);
-    println!("ch1(#1 chB, 增益 32) = {:>8}", b.ch1);
-    println!("ch2(#2 chA, 增益128) = {:>8}", b.ch2);
+    println!("device ID : 0x{:04X} ({})", b.dev_id, b.dev_id);
+    println!("counter   : {}", b.counter);
+    println!("battery   : {} mV", b.batt_mv);
+    println!("ch0(#1 chA, gain 128) = {:>8}", b.ch0);
+    println!("ch1(#1 chB, gain  32) = {:>8}", b.ch1);
+    println!("ch2(#2 chA, gain 128) = {:>8}", b.ch2);
 }
 
 /// 一轮结束时打印收包率 —— 这是判断"是否漏收"的核心输出。
@@ -213,11 +213,11 @@ fn print_round_summary(dev_id: u16, r: &Round, expect: u32) {
         format!("{}..{} dBm", r.rssi_min, r.rssi_max)
     };
     println!(
-        "  └─ 设备 0x{:04X} 计数器 {} 一轮结束: 收到 {}/{} 包 ({:.0}%), 历时 {:.1}s, RSSI {}",
+        "  +- device 0x{:04X} counter {} burst done: {}/{} packets ({:.0}%), over {:.1}s, RSSI {}",
         dev_id, r.counter, r.packets, expect, pct, dur.as_secs_f64(), rssi
     );
     if pct < 50.0 {
-        println!("     ⚠ 收包率偏低。可尝试: 靠近设备 / 关掉其它蓝牙设备 / 见 README「漏收」一节");
+        println!("     ! low capture rate. Try moving closer, or turning off other BLE devices; see the 'missed packets' section of the README");
     }
     println!();
 }
@@ -259,11 +259,12 @@ fn parse_args() -> (u32, bool) {
             }
             "--verbose" | "-v" => verbose = true,
             "--help" | "-h" => {
-                println!("用法: sensor-beacon-scanner [选项]");
-                println!("  -e, --events N   一轮的广播事件数(默认 {}, 须与固件", DEFAULT_ADV_EVENTS);
-                println!("                   BLE_BEACON_ADV_EVENTS 一致), 仅用于算收包率");
-                println!("  -v, --verbose    打印每个重复包(默认只在行内刷新计数)");
-                println!("  -h, --help       显示本帮助");
+                println!("Usage: sensor-beacon-scanner [options]");
+                println!("  -e, --events N   advertising events per burst (default {}, must match", DEFAULT_ADV_EVENTS);
+                println!("                   the firmware BLE_BEACON_ADV_EVENTS); only used to compute");
+                println!("                   the capture rate");
+                println!("  -v, --verbose    print every duplicate packet (default: update a counter in place)");
+                println!("  -h, --help       show this help");
                 std::process::exit(0);
             }
             _ => {}
@@ -277,35 +278,35 @@ async fn main() -> Result<()> {
     let (expect_events, verbose) = parse_args();
     let expect_packets = expect_events * CHANNELS_PER_EVENT;
 
-    let manager = Manager::new().await.context("创建蓝牙管理器失败")?;
-    let adapters = manager.adapters().await.context("枚举蓝牙适配器失败")?;
+    let manager = Manager::new().await.context("failed to create the Bluetooth manager")?;
+    let adapters = manager.adapters().await.context("failed to enumerate Bluetooth adapters")?;
     if adapters.is_empty() {
-        bail!("未找到蓝牙适配器");
+        bail!("no Bluetooth adapter found");
     }
 
     let central = adapters.into_iter().next().unwrap();
-    let info = central.adapter_info().await.context("读取适配器信息失败")?;
-    println!("适配器: {}", info);
+    let info = central.adapter_info().await.context("failed to read adapter info")?;
+    println!("adapter: {}", info);
     println!(
-        "过滤: Company ID 0x{:04X}, 魔数 0x{:02X}, 版本 0x{:02X}",
+        "filter: Company ID 0x{:04X}, magic 0x{:02X}, version 0x{:02X}",
         COMPANY_ID, MAGIC, VERSION
     );
     println!(
-        "一轮理论包数: {} 事件 × {} 信道 = {} 包(用 --events 改)",
+        "packets per burst in theory: {} events x {} channels = {} (override with --events)",
         expect_events, CHANNELS_PER_EVENT, expect_packets
     );
-    println!("设备平时静默 —— 单击设备按键后才有数据。Ctrl+C 退出。");
+    println!("The device stays silent until its button is tapped. Ctrl+C to quit.");
     println!();
 
     /* ⚠ 先订阅事件再启动扫描。反过来的话, start_scan 到 events 之间收到的
      * 广播会全部丢失 —— broadcast 通道对"当时还没有订阅者"的消息是直接丢弃的
      * (adapter_manager.rs:51 的 Err(lost) 分支只打一条 trace 日志)。 */
-    let mut events = central.events().await.context("订阅扫描事件失败")?;
+    let mut events = central.events().await.context("failed to subscribe to scan events")?;
 
     central
         .start_scan(ScanFilter::default())
         .await
-        .context("启动扫描失败")?;
+        .context("failed to start scanning")?;
 
     /* dev_id → 当前轮 */
     let mut rounds: HashMap<u16, Round> = HashMap::new();
@@ -356,14 +357,14 @@ async fn main() -> Result<()> {
                 r.hit(rssi);
                 if verbose {
                     println!(
-                        "     · 重复包 #{:<2} 设备 0x{:04X} RSSI {}",
+                        "     . duplicate #{:<2} device 0x{:04X} RSSI {}",
                         r.packets,
                         b.dev_id,
                         rssi.map_or_else(|| "n/a".into(), |v| format!("{} dBm", v))
                     );
                 } else {
                     /* 行内刷新: 不滚屏也能看到收包在涨 */
-                    print!("\r  收包 {}/{} ...", r.packets, expect_packets);
+                    print!("\r  captured {}/{} ...", r.packets, expect_packets);
                     use std::io::Write;
                     let _ = std::io::stdout().flush();
                 }

@@ -63,7 +63,7 @@ static RT: LazyLock<Runtime> = LazyLock::new(|| {
         .worker_threads(2)
         .enable_all()
         .build()
-        .expect("创建 tokio runtime 失败")
+        .expect("failed to create the tokio runtime")
 });
 
 /// 适配器只取一次并缓存 —— `Manager::new()` 在 Windows 上要跨进程问 WinRT,
@@ -144,11 +144,11 @@ impl From<adv::AdvPayload> for AdvPayloadDto {
 async fn adapter() -> Result<&'static Adapter> {
     ADAPTER
         .get_or_try_init(|| async {
-            let manager = Manager::new().await.context("创建蓝牙管理器失败")?;
-            let list = manager.adapters().await.context("枚举蓝牙适配器失败")?;
+            let manager = Manager::new().await.context("failed to create the Bluetooth manager")?;
+            let list = manager.adapters().await.context("failed to enumerate Bluetooth adapters")?;
             list.into_iter()
                 .next()
-                .ok_or_else(|| anyhow!("未找到蓝牙适配器 —— 确认系统蓝牙已开启"))
+                .ok_or_else(|| anyhow!("no Bluetooth adapter found -- check that system Bluetooth is on"))
         })
         .await
 }
@@ -157,12 +157,12 @@ async fn adapter() -> Result<&'static Adapter> {
 pub fn adapter_name() -> Result<String> {
     RT.block_on(async {
         let a = adapter().await?;
-        a.adapter_info().await.context("读取适配器信息失败")
+        a.adapter_info().await.context("failed to read adapter info")
     })
 }
 
 pub fn mode() -> Mode {
-    STATE.lock().expect("STATE 被 poison").mode
+    STATE.lock().expect("STATE mutex poisoned").mode
 }
 
 /// 取 MAC 与 RSSI。
@@ -221,12 +221,12 @@ where
     F: Fn(AdvEvent) + Send + Sync + 'static,
 {
     {
-        let st = STATE.lock().expect("STATE 被 poison");
+        let st = STATE.lock().expect("STATE mutex poisoned");
         match st.mode {
             Mode::Scanning => return Ok(()), // 幂等: 已在扫描
             Mode::Connected => {
                 return Err(anyhow!(
-                    "已连接设备时不能扫描 —— 设备侧连接期间不播数据广播, 请先断开"
+                    "cannot scan while connected: the device stops advertising data for the duration of a connection, so disconnect first"
                 ))
             }
             Mode::Idle => {}
@@ -238,16 +238,16 @@ where
             // 扫描循环异常退出: 把状态收回 Idle, 否则 UI 会一直显示"扫描中"
             // 却再也收不到包。错误经 on_event 报不出去(那是数据通道),
             // 只能落日志 —— UI 侧靠 mode() 变回 Idle 察觉。
-            eprintln!("[ble] 扫描循环异常退出: {e:#}");
+            eprintln!("[ble] scan loop exited with an error: {e:#}");
         }
-        let mut st = STATE.lock().expect("STATE 被 poison");
+        let mut st = STATE.lock().expect("STATE mutex poisoned");
         if st.mode == Mode::Scanning {
             st.mode = Mode::Idle;
             st.scan_task = None;
         }
     });
 
-    let mut st = STATE.lock().expect("STATE 被 poison");
+    let mut st = STATE.lock().expect("STATE mutex poisoned");
     st.mode = Mode::Scanning;
     st.scan_task = Some(task);
     Ok(())
@@ -263,14 +263,14 @@ where
     //   收到的广播会全部丢失 —— btleplug 的 broadcast 通道对"当时还没有订阅者"
     //   的消息直接丢弃(common/adapter_manager.rs 的 Err(lost) 分支只打 trace)。
     //   这条是 scanner 那边踩过并写进注释的坑。
-    let mut events = central.events().await.context("订阅扫描事件失败")?;
+    let mut events = central.events().await.context("failed to subscribe to scan events")?;
 
     // ScanFilter::default() = 不过滤。btleplug 的 ScanFilter 只能按 service UUID
     // 过滤, 而我们要按 Company ID —— 那是厂商自定义段, 只能自己筛。
     central
         .start_scan(ScanFilter::default())
         .await
-        .context("启动扫描失败")?;
+        .context("failed to start scanning")?;
 
     while let Some(ev) = events.next().await {
         let Some((id, raw)) = extract(central, ev).await else {
@@ -307,7 +307,7 @@ where
 /// 停止扫描并交还适配器。未在扫描时安全。
 pub fn scan_stop() -> Result<()> {
     let task = {
-        let mut st = STATE.lock().expect("STATE 被 poison");
+        let mut st = STATE.lock().expect("STATE mutex poisoned");
         if st.mode != Mode::Scanning {
             return Ok(());
         }
