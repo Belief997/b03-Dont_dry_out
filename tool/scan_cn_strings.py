@@ -1,7 +1,7 @@
 """Find Chinese inside real string literals (C / Rust / Dart), ignoring comments.
 
-Usage: python _scan_cn_strings.py <file> [<file> ...]
-       python _scan_cn_strings.py --fix-list <file> ...   (one "path:line" per hit)
+Usage: python scan_cn_strings.py <file> [<file> ...]
+       python scan_cn_strings.py --fix-list <file> ...   (one "path:line" per hit)
 """
 import io
 import sys

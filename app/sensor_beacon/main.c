@@ -443,7 +443,7 @@ static void stability_update(void)
  *   若日后增益配置可能变更, 应在负载中显式编码(当前余量 8 字节)。
  *
  * ⚠ 每通道 3 字节而非 2 字节: HX711 原生输出有符号 24bit,实测读数
- *   (见 _solve.py 标定数据)达 ±8 万量级,远超 int16 的 ±32767,压成
+ *   (见 dev/tool/solve_calibration.py 的标定数据)达 ±8 万量级,远超 int16 的 ±32767,压成
  *   2 字节会溢出失真。故保留 24bit 原样传输,由网关做符号扩展。
  */
 #define SENSOR_CH_COUNT             3
