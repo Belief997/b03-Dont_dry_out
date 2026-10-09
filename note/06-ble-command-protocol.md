@@ -501,7 +501,7 @@ RESPONSE frame 1  设备 -> 上位机
 | 16 | 2 | `batt_mv` | 电池电压 mV |
 | 18 | 2 | `flags` | 数据状态，见下 |
 | 20 | 4 | `sample_tick` | `m_sample_tick`，采样节拍序号 |
-| 24 | 2 | `p2p_max` | 三通道峰峰值里的最大者（counts），用于观察震荡幅度 |
+
 
 `flags` 位定义（低 8 位与 `app_proto.h` 的 `APP_PROTO_FLAG_*` **保持一致**，
 高 8 位见 §7.3）：

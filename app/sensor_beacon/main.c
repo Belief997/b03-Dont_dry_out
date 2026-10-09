@@ -1484,8 +1484,24 @@ static void handle_event_active(void)
 
 static void hx711_init(hx711_t * dev)
 {
-    nrf_gpio_cfg_output(dev->sck_pin);
+    /* ---- SCK(PD_SCK): 空闲必须为低 ----
+     * HX711 数据手册: PD_SCK 保持高 >60µs 即进入掉电模式; 空闲若悬空或被
+     * 扰动抬高, 芯片会掉电/重启, 读数错乱。故这里硬配置为【输出低】,
+     * 并同时开内部下拉 —— 输出推挽时下拉不参与电平(驱动直接拉低), 但它
+     * 保证该脚一旦被改回输入(或方向被别处改动)也不悬空, 仍为低。
+     *
+     * ⚠ 顺序: 先写 OUT 锁存器 = 0, 再切输出方向。nrf_gpio_cfg_output()
+     *   只改 PIN_CNF、不碰 OUT; 若反过来, 切方向瞬间引脚会按 OUT 的残留
+     *   值驱动(复位默认 0, 但不能依赖它), 可能给 HX711 打出一个高脉冲。 */
     nrf_gpio_pin_clear(dev->sck_pin);
+    nrf_gpio_cfg(dev->sck_pin,
+                 NRF_GPIO_PIN_DIR_OUTPUT,
+                 NRF_GPIO_PIN_INPUT_DISCONNECT,
+                 NRF_GPIO_PIN_PULLDOWN,
+                 NRF_GPIO_PIN_S0S1,
+                 NRF_GPIO_PIN_NOSENSE);
+
+    /* DT(DOUT): HX711 数据输出, 空闲高 */
     nrf_gpio_cfg_input(dev->dt_pin, NRF_GPIO_PIN_PULLUP);
     /* 上电默认正在转换 Channel A: "上一次读取"视为 25 脉冲 */
     dev->pulses = HX711_PULSES_CHA_128;
