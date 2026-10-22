@@ -154,28 +154,17 @@
  *  HX711 引脚 & 参数
  * ==================================================================
  *
- * 引脚选取约束(同时满足 PCA10040 DK 台架调试与 E73-TBM 真机):
- *   - DK 占用    : P0.13~16 = Button1~4, P0.17~20 = LED1~4, P0.06/08 = UART
- *   - E73-TBM 占用: P0.13/14 = 按键, P0.17/18 = LED, P0.05~08 = CH340 UART,
- *                   P0.09/10 = NFC 焊盘, P0.21 = 复位
- *   - P0.25~29 紧邻射频,数据手册 Table 100 限定"低驱动、低频 I/O only",
- *     SCK 为数百 kHz 时钟脉冲,不可用
- *   - P0.02~05 = AIN0~3,留给模拟输入
- *   → 两板交集中安全可用: P0.11, P0.12, P0.22, P0.23, P0.24
+ * 引脚约束(DK 台架与 E73-TBM 真机都要能用):
+ *   - DK 占用     : P0.13~16 按键, P0.17~20 LED, P0.05~08 UART
+ *   - E73-TBM 占用: P0.13/14 按键, P0.17/18 LED, P0.05~08 CH340, P0.21 复位,
+ *                   P0.09/10 NFC 焊盘(52810 无 NFCT, 其实可当普通 IO)
+ *   - P0.25~29 紧邻射频(Table 100 "低驱动低频 only"), SCK 时钟不能用
+ *   - P0.00/01 被 32.768kHz 晶振占用
  *
- * ⚠ P0.22/23/24 在 QFN48 上与 SWDIO/SWDCLK 相邻但功能独立,不影响调试。
- *
- * 当前分配情况(上面 5 个安全引脚已全部用掉):
- *   P0.11/12 = HX711 #1, P0.23/24 = HX711 #2, P0.22 = WAKE_PIN
- * 若日后还需引脚, 候选只剩下面这些, 各有代价:
- *   - P0.15/16 : 真机空闲, 但 DK 上是 Button3/4(台架调试会冲突)
- *   - P0.19/20 : 真机空闲, 但 DK 上是 LED3/4
- *   - P0.30/31 : 两板都空闲且不在 Table 100 名单内, 但占用 AIN6/AIN7
- *   - P0.25~29 : 仅限低速信号(慢速电平输入可以, 时钟/PWM 不行)
- *   - P0.09/10 : 真机是 NFC 焊盘, 但 nRF52810 无 NFCT 外设(已核
- *                nrf52810_peripherals.h 无 NFCT_PRESENT), 故可当普通 GPIO
- *   - P0.00/01 : 若 LF 时钟改用内部 RC 则可释放。当前
- *                NRF_SDH_CLOCK_LF_SRC = 1 (XTAL), 被 32.768kHz 晶振占用
+ * 当前分配: P0.11/12 = HX711 #1, P0.23/24 = HX711 #2, P0.22 = WAKE_PIN,
+ *           P0.03 = SENSOR_PWR_PIN
+ * 两板都空闲且无限制的还剩 P0.02/04/30/31。它们是 AIN 脚, 但 SAADC 用的是
+ * 内部 VDD、不占引脚, 可随便用。完整占用表跑 dev/tool/pinmap.py, 别手数。
  */
 
 /* --- HX711 #1 --- */
@@ -185,6 +174,18 @@
 /* --- HX711 #2 --- */
 #define HX711_2_DT_PIN              23
 #define HX711_2_SCK_PIN             24
+
+/* --- 传感器供电开关: MOS 管栅极, 两路 HX711 共用一路电源 ---
+ * SENSOR_PWR_ON_LEVEL = 导通电平:
+ *   0 = 低电平导通, 高边 P-MOS 栅极直驱(默认; 传感器与 MCU 同一路电源时用)
+ *   1 = 高电平导通, 经 NPN/N-MOS 反相驱动 P-MOS(传感器电源高于 VDD 时必须这样)
+ * ⚠ 栅极要外接电阻默认拉到关断电平(P-MOS 直驱 = ~100k 上拉到源极):
+ *   复位/烧录期间引脚是高阻, 只靠它保持关断。
+ * ⚠ 别用低边 N-MOS 断地: DT/SCK 与 MCU 共地, 断地后电流会经 IO 绕行。
+ * ⚠ 传感器侧电容大时, 接通瞬间会把 VDD 拉塌、触发掉电复位(表现为开机反复重启),
+ *   栅极加 RC 缓启动。 */
+#define SENSOR_PWR_PIN              3
+#define SENSOR_PWR_ON_LEVEL         0
 
 /* 不同增益对应的 SCK 脉冲总数(含 24bit 数据 + N 个增益选择脉冲)
  * ⚠ chA 与 chB 增益不对等(硬件固定): chB 只能是 32, chA 可 128/64。
@@ -489,6 +490,30 @@ static volatile bool            m_settled  = false;   /* 稳定等待结束 */
 static uint8_t                  m_counter  = 0;        /* 8bit 事件计数器 */
 
 /* ==================================================================
+ *  传感器供电(MOS 管开关)
+ * ================================================================== */
+
+/* on = true 接通, false 切断。可重复调用, 无需单独 init。
+ * 调用点: 开机(分支 1)/事件唤醒(分支 3)时接通; 进 System OFF 前切断。
+ * ⚠ 切断前先撤 DT 的内部上拉: 否则上拉电流经 HX711 的 IO 保护二极管倒灌进
+ *   它的电源, 断电断不干净。SCK 平时是输出低(或未配置), 不倒灌。
+ * ⚠ 若要运行中断电再接通: HX711 会复位回通道 A/128, 而 DT 此时已断开输入、
+ *   读出来恒为 0(会被当成"数据就绪")—— 必须重新 hx711_init() 并重置采样状态机。 */
+static void sensor_power_set(bool on)
+{
+    if (!on)
+    {
+        nrf_gpio_cfg_default(HX711_1_DT_PIN);
+        nrf_gpio_cfg_default(HX711_2_DT_PIN);
+    }
+
+    /* 先写 OUT 再切输出方向, 免得切换瞬间按 OUT 残留值打出错误电平 */
+    nrf_gpio_pin_write(SENSOR_PWR_PIN,
+                       on ? SENSOR_PWR_ON_LEVEL : !SENSOR_PWR_ON_LEVEL);
+    nrf_gpio_cfg_output(SENSOR_PWR_PIN);
+}
+
+/* ==================================================================
  *  启动阶段: 复位原因 / 计数器 / 唤醒电平(SoftDevice 未使能 → 直接寄存器)
  * ================================================================== */
 
@@ -517,7 +542,10 @@ static bool boot_read_and_classify(uint32_t * p_resetreas)
  * 调用前必须已用 nrf_gpio_cfg_sense_set() 武装唤醒电平。 */
 static void system_off_direct(void)
 {
-    NRF_LOG_INFO("System OFF (direct), sense armed.");
+    /* GPIO 输出状态在 System OFF 下保持, 所以这里切断就整个睡眠期都断着 */
+    sensor_power_set(false);
+
+    NRF_LOG_INFO("System OFF (direct), sense armed, sensor power cut.");
     NRF_LOG_FLUSH();
 
     NRF_POWER->SYSTEMOFF = 1;
@@ -1378,7 +1406,9 @@ static void handle_event_active(void)
     power_management_init();
     saadc_init();
 
-    /* 3) 等待传感器稳定(RTC 定时 + WFE 空闲,严禁 nrf_delay 忙等) */
+    /* 3) 接通传感器电源, 等它稳定(RTC 定时 + WFE 空闲,严禁 nrf_delay 忙等)。
+     *    SETTLING_TIME_MS 从这里起算, 所以上电必须放在启动定时器之前。 */
+    sensor_power_set(true);
     m_settled = false;
     err = app_timer_start(m_settling_timer, APP_TIMER_TICKS(SETTLING_TIME_MS), NULL);
     APP_ERROR_CHECK(err);
@@ -1423,6 +1453,9 @@ static void handle_event_active(void)
     NRF_LOG_FLUSH();
 
     (void)ble_beacon_stop();
+
+    /* 这条路径不经过 system_off_direct(), 要自己断传感器电源 */
+    sensor_power_set(false);
 
     nrf_gpio_cfg_input(WAKE_PIN, WAKE_PIN_PULL);
     nrf_gpio_cfg_sense_set(WAKE_PIN, NRF_GPIO_PIN_SENSE_LOW);
@@ -1880,7 +1913,10 @@ int main(void)
     timers_init();
     power_management_init();
 
-    /* 3) 初始化两路 HX711(配置各自 DT/SCK GPIO) */
+    /* 3) 接通传感器电源, 再初始化两路 HX711(配置各自 DT/SCK GPIO)。
+     *    ⚠ 顺序不能反: DT 带内部上拉, 先配它再上电会经 IO 倒灌进 HX711。
+     *    上电后不必延时等待: HX711 稳定前 DOUT 保持高, 轮询自然跳过。 */
+    sensor_power_set(true);
     hx711_init(&m_hx711_1);
     hx711_init(&m_hx711_2);
 
